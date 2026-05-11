@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+
+# Claude Code per-machine harness state
+.claude/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
