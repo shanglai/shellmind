@@ -1,5 +1,5 @@
 # Shellmind — Architecture Reference
-> Last updated: v0.2.0 — Tasks 1–8 + __record hook landed in 36fec8e
+> Last updated: v0.3.0 — native StepKind inference, Windows hook hardening, scheduled procedures landed in 1ea3b1d
 
 ---
 
@@ -36,7 +36,11 @@ src/
 │   └── mod.rs                 EmbeddingStore, EmbeddingSource, embed_text(), BoW + optional fastembed
 │
 ├── session/                   Runtime history — ring buffer, wrap machinery
-│   └── mod.rs                 SessionBuffer, WrapPreview, build_wrap_preview(), finalize_wrap()
+│   ├── mod.rs                 SessionBuffer, WrapPreview, build_wrap_preview(), finalize_wrap()
+│   └── infer.rs               Heuristic StepKind inference for `sm wrap`
+│                              (curl/wget→HttpCall, cp→FileCopy, mv→FileMove,
+│                              rm→FileDelete, mkdir→MkDir, echo→Echo/WriteFile,
+│                              export→SetEnv, VAR=val→SetEnv)
 │
 ├── disambiguator/             Disambiguation layer — sits between Stage 2/3 and Resolution
 │   └── mod.rs                 evaluate(), prompt(), ScoredCandidate, re-ranking passes
@@ -52,6 +56,9 @@ src/
 │
 ├── editor/                    $EDITOR / $VISUAL integration, reload + re-embed on save
 │   └── mod.rs                 open_in_editor(), reload_and_reindex()
+│
+├── scheduler/                 Cron-driven invocation of registered verbs
+│   └── mod.rs                 Schedule, ScheduleStore, parse_cron() (5- or 6-field via cron crate)
 │
 └── cli/                       User-facing dispatch + all command handlers (~1300 lines)
     └── mod.rs                 dispatch(), cmd_add(), cmd_wrap(), cmd_resolve(), cmd_run(), cmd_edit(), cmd_remove(), cmd_rename(), …
@@ -224,6 +231,29 @@ reload_and_reindex(verb: &str, paths: &ShellmindPaths) → Result<()>
   ← returns Err with hint if the verb was changed inside the editor
 ```
 
+### `scheduler/mod.rs`
+
+```rust
+Schedule
+  .id, .name, .verb, .args: Vec<String>
+  .cron: String                    ← 5-field "m h dom mon dow"
+  .enabled: bool
+  .created_at, .last_run, .next_run: DateTime<Utc>
+  ::new(name, verb, args, cron) → Result<Self>   ← validates cron, computes next_run
+  .compute_next_after(after) → Result<Option<DateTime<Utc>>>
+  .is_due(now) → bool              ← enabled && now >= next_run
+
+ScheduleStore
+  ::new(dir: &Path) → Self          ← config_dir/schedules/
+  .load_all()             → Result<Vec<Schedule>>
+  .get(name)              → Result<Option<Schedule>>
+  .put(schedule)          → Result<()>
+  .delete(name)           → Result<bool>
+
+parse_cron(s: &str) → Result<cron::Schedule>
+  ← accepts standard 5-field; normalises to crate's 6-field by prepending "0 "
+```
+
 ### `session/mod.rs`
 
 ```rust
@@ -343,6 +373,19 @@ cmd_rename(old, new, paths)             sm rename <old> <new>
 cmd_edit(verb, paths)                   sm edit <verb>
 cmd_run(verb, slots, paths)             sm run <verb> [args]     ← bypasses shell hook
 __record                                sm __record <cmd>        ← internal, called by shell hook
+
+// Roadmap #3 (scheduler):
+cmd_schedule(rest, paths)               sm schedule <subcommand> ...
+  cmd_schedule_add                        add <name> "<cron>" <verb> [args...]
+  cmd_schedule_list                       list
+  cmd_schedule_remove                     remove <name>
+  cmd_schedule_set_enabled                enable | disable <name>
+  cmd_schedule_next                       next
+  cmd_schedule_run                        run        ← wired into external cron/Task Scheduler
+
+// Shared (extracted from cmd_run, reused by scheduler):
+load_entry(verb, paths) → Result<CommandEntry>
+run_entry(entry, slots) → Result<RunOutcome>      ← does NOT std::process::exit on failure
 
 // sm add modes:
 // sm add <verb> "<expansion>" [arg1 arg2 ...]  → one-liner alias, immediate curated
@@ -480,15 +523,16 @@ The shell hook eval's it, which calls back into `sm` as `cmd_exec`, which runs `
 
 ## 7. Known Gaps / Next Development Priorities
 
-Completed in 36fec8e: `sm init --write`, redb integration, optional fastembed (MiniLM-L6-v2), `sm edit`, `sm remove`, `sm rename`. Plus bonus `sm run` and `__record` session capture.
+Completed: `sm init --write`, redb cache (36fec8e), optional fastembed (36fec8e), `sm edit`/`remove`/`rename`/`run`/`__record` (36fec8e), native `StepKind` inference in `sm wrap` (4ba155e), Windows hook hardening + pwsh detection + PS `__record` (1dbd20e), scheduled procedures with `sm schedule` (1ea3b1d).
 
 | Priority | Feature | Module | Notes |
 |---|---|---|---|
-| 1 | Native `StepKind` inference in `wrap` | `session`, `cli` | Currently wraps `ShellRaw` only; detect curl/wget→`HttpCall`, cp→`FileCopy`, mv→`FileMove`, mkdir→`MkDir`, rm→`FileDelete`, export→`SetEnv`, echo→`Echo` |
-| 2 | Windows ConPTY testing | `platform/shell.rs`, `cli` | PowerShell hook end-to-end on real Windows shell; verify `__exec`, `__record` paths |
-| 3 | Scheduled procedures | `cli`, new `scheduler/mod.rs` | Cron-like execution of registered procedures |
-| 4 | Config file parser | `cli/load_model_config` | Currently line-by-line; use `serde_json` / `toml` |
-| 5 | Drop `=` version pins | `Cargo.toml` | Inherited from Rust 1.75 sandbox; modern toolchain doesn't need them |
+| 1 | Config file parser | `cli/load_model_config` | Currently line-by-line; use `serde_json` / `toml` |
+| 2 | Drop `=` version pins | `Cargo.toml` | Inherited from Rust 1.75 sandbox; modern toolchain doesn't need them |
+| 3 | Real HTTP for `HttpCall` | `platform/executor.rs` | Currently stubbed with a `tracing::warn` — needs `reqwest` to actually fire the call |
+| 4 | Windows VT escape enablement | `main.rs` startup | ANSI codes render as literal text in legacy `conhost.exe`; need `SetConsoleMode(ENABLE_VIRTUAL_TERMINAL_PROCESSING)` |
+| 5 | Scheduler daemon mode | `scheduler`, `cli` | `sm schedule daemon` for environments without external cron / Task Scheduler |
+| 6 | `rustyline` for interactive prompts | `cli`, `disambiguator` | Replace `std::io::stdin().read_line` with history + completion |
 
 ---
 

@@ -27,7 +27,8 @@ When multiple candidates are close, a disambiguation prompt is shown on stderr. 
 - **Semantic memory** — flat binary embedding store; verbs are embedded on write and searched at resolve time
 - **Two-tier registry** — curated (trusted) and staging (inferred/unconfirmed); automatic promotion after 5 uses with confidence ≥ 0.70
 - **Confidence decay** — staging entries not used in 30 days are flagged for review
-- **Shell-agnostic hook** — works with Bash, Zsh, Fish, PowerShell, and Cmd; `sm init [--write]` prints the correct snippet for your shell or appends it to your rc file directly
+- **Shell-agnostic hook** — works with Bash, Zsh, Fish, PowerShell, and Cmd; `sm init [--write]` prints the correct snippet for your shell or appends it to your rc file directly. Bash/Zsh/Fish/PowerShell all capture native commands via `PROMPT_COMMAND`/`precmd`/`fish_postexec`/prompt-wrapping so `sm wrap` can see them
+- **Scheduled procedures** — `sm schedule add <name> "<cron>" <verb> [args...]` registers a 5-field cron; `sm schedule run` executes all due jobs (wire it into Unix cron or Windows Task Scheduler)
 - **Model-free by default** — all four resolution stages degrade gracefully; model inference is opt-in via environment variable
 - **Cross-platform executor** — 12 `StepKind` variants implemented in pure Rust with no `awk`/`python`/shell dependencies
 
@@ -55,6 +56,11 @@ When multiple candidates are close, a disambiguation prompt is shown on stderr. 
 | `sm list --staging` | List staging entries |
 | `sm reindex` | Rebuild the redb cache and embedding store from TOML registry |
 | `sm promote` | Run the promotion pass (decay, auto-promote, flag for review) |
+| `sm schedule add <name> "<cron>" <verb> [args...]` | Schedule a verb on a 5-field cron expression |
+| `sm schedule list` | List configured schedules with next-run times |
+| `sm schedule next` | Show upcoming runs sorted ascending |
+| `sm schedule run` | Run all due schedules now (wire into cron/Task Scheduler) |
+| `sm schedule remove <name>` / `enable <name>` / `disable <name>` | Lifecycle management |
 
 ---
 
@@ -129,15 +135,15 @@ Source trust levels: `declarative` → `inferred:<model>:<score>` → `confirmed
 
 ## TODOs / Roadmap
 
-Completed in earlier passes: `sm init --write`, `redb` integration, optional `fastembed` (MiniLM-L6-v2) embeddings, `sm edit`, `sm remove`, `sm rename`, plus bonus `sm run` and shell-hook `__record` capture.
+Completed: `sm init --write`, `redb` cache, optional `fastembed` (MiniLM-L6-v2) embeddings, `sm edit`, `sm remove`, `sm rename`, `sm run`, shell-hook `__record` capture across bash/zsh/fish/PowerShell, native `StepKind` inference in `sm wrap` (curl/wget/cp/mv/rm/mkdir/echo/export/env-prefix), Windows hook hardening (pwsh.exe detection, PS prompt-wrap `__record`, full mgmt list), scheduled procedures via `sm schedule`.
 
 | Priority | Feature | Notes |
 |---|---|---|
-| 1 | Native `StepKind` inference in `wrap` | Currently `wrap` only captures `ShellRaw`; should detect curl/wget→`HttpCall`, cp→`FileCopy`, mv→`FileMove`, mkdir→`MkDir`, rm→`FileDelete`, export→`SetEnv`, echo→`Echo` |
-| 2 | Windows ConPTY testing | PowerShell hook path not yet end-to-end tested on a real Windows shell |
-| 3 | Scheduled procedures | Cron-like execution of registered procedures (new module) |
-| 4 | Config file parser | Replace line-by-line model config parsing with `serde_json` / `toml` |
-| 5 | Drop the rest of the version pins | `Cargo.toml` still has `=` pins from the Rust 1.75 sandbox era; modern toolchain doesn't need them |
+| 1 | Config file parser | Replace line-by-line model config parsing with `serde_json` / `toml` |
+| 2 | Drop the rest of the `=` version pins | Inherited from a Rust 1.75 sandbox era; modern toolchain doesn't need them |
+| 3 | Real HTTP for `HttpCall` | Currently stubbed — needs `reqwest` (was deliberately deferred from the original sandbox cutover) |
+| 4 | Windows VT escape enablement | ANSI colour codes render as literal text in legacy `conhost.exe`; need `SetConsoleMode(ENABLE_VIRTUAL_TERMINAL_PROCESSING)` on startup |
+| 5 | Scheduler daemon mode | `sm schedule daemon` for environments without external cron / Task Scheduler |
 
 ---
 
@@ -154,6 +160,7 @@ src/
 ├── resolver/            4-stage resolution pipeline (redb fast path when warm)
 ├── model_client/        OpenAI-compatible inference client (curl subprocess)
 ├── editor/              $EDITOR / $VISUAL integration, reload + re-embed on save
+├── scheduler/           Cron-driven invocation of registered verbs
 └── cli/                 All user-facing command handlers
 ```
 
