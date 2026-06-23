@@ -1,5 +1,5 @@
 # Shellmind — Architecture Reference
-> Last updated: v0.1.0 — 3,270 lines across 16 source files
+> Last updated: v0.2.0 — Tasks 1–8 + __record hook landed in 36fec8e
 
 ---
 
@@ -30,10 +30,10 @@ src/
 ├── registry/                  Command storage — dual-store (curated + staging)
 │   ├── mod.rs                 CommandEntry, EntryKind, Registry, TOML/JSON serialization
 │   ├── promotion.rs           PromotionPolicy, confidence decay, confirm/demote
-│   └── store.rs               Stub — future redb O(1) lookup
+│   └── store.rs               RegistryStore — redb O(1) verb lookup, cache over TOML SoT
 │
 ├── embedder/                  Semantic memory — flat binary embedding store
-│   └── mod.rs                 EmbeddingStore, EmbeddingSource, embed_text_bow()
+│   └── mod.rs                 EmbeddingStore, EmbeddingSource, embed_text(), BoW + optional fastembed
 │
 ├── session/                   Runtime history — ring buffer, wrap machinery
 │   └── mod.rs                 SessionBuffer, WrapPreview, build_wrap_preview(), finalize_wrap()
@@ -50,11 +50,11 @@ src/
 ├── executor/                  Re-export shim
 │   └── mod.rs                 pub use crate::platform::executor::*
 │
-├── editor/                    Stub — $EDITOR integration (not yet implemented)
-│   └── mod.rs
+├── editor/                    $EDITOR / $VISUAL integration, reload + re-embed on save
+│   └── mod.rs                 open_in_editor(), reload_and_reindex()
 │
-└── cli/                       User-facing dispatch + all command handlers (849 lines)
-    └── mod.rs                 dispatch(), cmd_add(), cmd_wrap(), cmd_resolve(), …
+└── cli/                       User-facing dispatch + all command handlers (~1300 lines)
+    └── mod.rs                 dispatch(), cmd_add(), cmd_wrap(), cmd_resolve(), cmd_run(), cmd_edit(), cmd_remove(), cmd_rename(), …
 ```
 
 ---
@@ -180,6 +180,8 @@ impl Registry (extended):
 ### `embedder/mod.rs`
 
 ```rust
+EMBED_DIM = 384 (semantic-embeddings feature) | 512 (default bow-embeddings)
+
 EmbeddingSource { Curated(1.0x), Staging(0.85x), Wrapped(1.15x) }
 
 EmbeddingStore
@@ -190,9 +192,36 @@ EmbeddingStore
   .search(query: &[f32], top_k, threshold) → Vec<(String, f32)>  ← boosted scores desc
   .save()
 
+embed_text(text: &str, dim: usize) → Vec<f32>
+  ← unified entry point; tries fastembed (MiniLM-L6-v2) under semantic-embeddings,
+    falls back to embed_text_bow on init/embed failure
+
 embed_text_bow(text: &str, dim: usize) → Vec<f32>
-  ← bag-of-words hash, L2 normalized, dim=512 by default
-  ← REPLACE with fastembed ONNX for production quality
+  ← bag-of-words hash, L2 normalized, dim=512
+```
+
+### `registry/store.rs`
+
+```rust
+RegistryStore                                   ← redb cache layer over TOML SoT
+  ::open(path: &Path) → Result<Self>
+  .get(verb)               → Result<Option<CommandEntry>>
+  .put(entry)              → Result<()>
+  .delete(verb)            → Result<()>
+  .all_entries()           → Result<Vec<CommandEntry>>
+  .all_verbs()             → Result<Vec<String>>
+  .rebuild_from_toml_dir(dir, registry) → Result<usize>   ← wipes and reloads
+```
+
+### `editor/mod.rs`
+
+```rust
+open_in_editor(path: &Path) → Result<()>
+  ← $EDITOR → $VISUAL → first available of {nano, vi, notepad} → "vi"
+  ← blocks until editor exits, returns Err on non-zero exit
+reload_and_reindex(verb: &str, paths: &ShellmindPaths) → Result<()>
+  ← re-reads the entry from disk and updates its embedding vector
+  ← returns Err with hint if the verb was changed inside the editor
 ```
 
 ### `session/mod.rs`
@@ -297,16 +326,23 @@ ModelClient
 dispatch(args, paths, shell_env) → Result<()>
 
 // User commands:
-cmd_init(paths, shell_env)              sm init
+cmd_init(rest, paths, shell_env)        sm init [--write]
 cmd_resolve(input, paths)               sm resolve <input>       ← called by shell hook
 cmd_exec(verb, slots, paths)            sm __exec <verb> [args]  ← internal, called by hook
 cmd_add(rest, paths)                    sm add …                 ← see below
 cmd_wrap(rest, paths)                   sm wrap last <N> as <verb>
 cmd_confirm(verb, paths)                sm confirm <verb>
 cmd_demote(verb, paths)                 sm demote <verb>
-cmd_list(staging, paths)                sm list [--staging]
-cmd_reindex(paths)                      sm reindex
+cmd_list(rest, paths)                   sm list [--staging|--detail|--by-usage|--by-date] [pattern]
+cmd_reindex(paths)                      sm reindex               ← rebuilds redb + embeddings
 cmd_promote(paths)                      sm promote
+
+// Task 2–7 additions:
+cmd_remove(verb, paths)                 sm remove <verb>
+cmd_rename(old, new, paths)             sm rename <old> <new>
+cmd_edit(verb, paths)                   sm edit <verb>
+cmd_run(verb, slots, paths)             sm run <verb> [args]     ← bypasses shell hook
+__record                                sm __record <cmd>        ← internal, called by shell hook
 
 // sm add modes:
 // sm add <verb> "<expansion>" [arg1 arg2 ...]  → one-liner alias, immediate curated
@@ -444,37 +480,35 @@ The shell hook eval's it, which calls back into `sm` as `cmd_exec`, which runs `
 
 ## 7. Known Gaps / Next Development Priorities
 
+Completed in 36fec8e: `sm init --write`, redb integration, optional fastembed (MiniLM-L6-v2), `sm edit`, `sm remove`, `sm rename`. Plus bonus `sm run` and `__record` session capture.
+
 | Priority | Feature | Module | Notes |
 |---|---|---|---|
-| 1 | `sm init --write` | `cli` | Detect rc file, append hook automatically |
-| 2 | `redb` integration | `registry/store.rs` | Replace JSON file scan — O(1) lookup |
-| 3 | Real embeddings | `embedder` | Swap `embed_text_bow` for `fastembed` (ONNX, Rust ≥ 1.80) |
-| 4 | `sm edit <verb>` | `editor/mod.rs` (stub) | `$EDITOR` integration for procedure editing |
-| 5 | Native StepKinds in `wrap` | `session`, `cli` | Currently wraps ShellRaw only |
-| 6 | Windows ConPTY testing | `platform/shell.rs` | Hook not tested on PowerShell |
-| 7 | `sm remove <verb>` | `cli` | Delete from registry + embeddings |
-| 8 | `sm rename <old> <new>` | `cli` | Rename verb, preserve history |
-| 9 | Scheduled procedures | `cli`, new `scheduler` | cron-like execution of procedures |
-| 10 | Config file parser | `cli/load_model_config` | Currently line-by-line; use serde_json |
+| 1 | Native `StepKind` inference in `wrap` | `session`, `cli` | Currently wraps `ShellRaw` only; detect curl/wget→`HttpCall`, cp→`FileCopy`, mv→`FileMove`, mkdir→`MkDir`, rm→`FileDelete`, export→`SetEnv`, echo→`Echo` |
+| 2 | Windows ConPTY testing | `platform/shell.rs`, `cli` | PowerShell hook end-to-end on real Windows shell; verify `__exec`, `__record` paths |
+| 3 | Scheduled procedures | `cli`, new `scheduler/mod.rs` | Cron-like execution of registered procedures |
+| 4 | Config file parser | `cli/load_model_config` | Currently line-by-line; use `serde_json` / `toml` |
+| 5 | Drop `=` version pins | `Cargo.toml` | Inherited from Rust 1.75 sandbox; modern toolchain doesn't need them |
 
 ---
 
 ## 8. Build Notes
 
-**Rust version constraint:** The sandbox used Rust 1.75 (Ubuntu apt). All crates are
-pinned to pre-`edition2024` versions in `Cargo.toml`. On a modern machine (Rust ≥ 1.80),
-remove the `=` version pins and let Cargo resolve normally.
+**Toolchain:** Tested on Rust 1.89 (Windows MSVC). Minimum is Rust ≥ 1.80 — required by `redb` and `fastembed` transitive deps. Most `Cargo.toml` entries still carry inherited `=` pins from a Rust 1.75 sandbox; they build fine on modern toolchains but are noise to clean up.
 
-**Missing crates** (removed due to sandbox constraints, add back on modern toolchain):
+**Features:**
+- `bow-embeddings` (default) — bag-of-words hash, 512-dim, no model download, fast compile
+- `semantic-embeddings` — pulls `fastembed`, downloads MiniLM-L6-v2 on first run, 384-dim. Falls back to BoW on init failure.
+
+**Crates intentionally still stubbed** (upgrade when convenient):
 - `reqwest` — replace `curl` subprocess in `model_client/mod.rs`
 - `shellexpand` — replace `expand_env()` in `platform/mod.rs`
 - `rustyline` — replace `std::io::stdin` readline in `cli/mod.rs`
-- `fastembed` — replace `embed_text_bow()` in `embedder/mod.rs`
-- `redb` — implement `registry/store.rs`
 
 **Build:**
 ```bash
-cargo build --release
-cp target/release/sm ~/.local/bin/
-sm init   # prints shell hook
+cargo build --release                                              # default BoW
+cargo build --release --no-default-features --features semantic-embeddings   # MiniLM
+cp target/release/sm ~/.local/bin/   # Linux/Mac
+sm init --write   # detect rc file and append hook
 ```

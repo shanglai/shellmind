@@ -12,7 +12,7 @@ When you type `sm <anything>`, the shell hook captures it and passes it through 
 
 1. **Exact match** — looks up your verb directly in the registry (curated-first)
 2. **Prefix / fuzzy match** — starts-with, ends-with, or Levenshtein distance ≤ 2
-3. **Semantic similarity** — bag-of-words embedding search (cosine similarity ≥ 0.72)
+3. **Semantic similarity** — embedding cosine search (≥ 0.72); BoW hash by default, MiniLM-L6-v2 via the optional `semantic-embeddings` feature
 4. **Model inference** — calls an OpenAI-compatible LLM to infer intent; result is stored in staging for review
 
 When multiple candidates are close, a disambiguation prompt is shown on stderr. When the winner is clear (score gap ≥ 0.12 or score ≥ 0.94), it auto-selects silently.
@@ -27,7 +27,7 @@ When multiple candidates are close, a disambiguation prompt is shown on stderr. 
 - **Semantic memory** — flat binary embedding store; verbs are embedded on write and searched at resolve time
 - **Two-tier registry** — curated (trusted) and staging (inferred/unconfirmed); automatic promotion after 5 uses with confidence ≥ 0.70
 - **Confidence decay** — staging entries not used in 30 days are flagged for review
-- **Shell-agnostic hook** — works with Bash, Zsh, Fish, PowerShell, and Cmd; `sm init` prints the correct snippet for your shell
+- **Shell-agnostic hook** — works with Bash, Zsh, Fish, PowerShell, and Cmd; `sm init [--write]` prints the correct snippet for your shell or appends it to your rc file directly
 - **Model-free by default** — all four resolution stages degrade gracefully; model inference is opt-in via environment variable
 - **Cross-platform executor** — 12 `StepKind` variants implemented in pure Rust with no `awk`/`python`/shell dependencies
 
@@ -38,16 +38,22 @@ When multiple candidates are close, a disambiguation prompt is shown on stderr. 
 | Command | Description |
 |---|---|
 | `sm init` | Print the shell hook snippet to paste into your rc file |
+| `sm init --write` | Detect your rc file and append the hook (idempotent) |
+| `sm hook` | Print the hook snippet only |
 | `sm add <verb> "<expansion>" [args...]` | Add a one-liner alias immediately to curated |
-| `sm add <verb>` | Interactive alias wizard |
-| `sm add proc <verb>` | Interactive procedure builder (8 step types) |
+| `sm add <verb>` | Interactive alias wizard (offers `[e]dit` on collision) |
+| `sm add proc <verb>` | Interactive procedure builder (12 step types) |
 | `sm wrap last <N> as <verb>` | Wrap the last N successful commands into a procedure |
 | `sm resolve <input>` | Resolve input and print the shell command (called by the hook) |
+| `sm run <verb> [args...]` | Execute a verb directly, bypassing the shell hook |
+| `sm edit <verb>` | Open the verb's definition in `$EDITOR`, re-index on save |
+| `sm rename <old> <new>` | Rename a verb, preserving its definition, embedding, and history |
+| `sm remove <verb>` | Delete a verb from the registry and embedding store |
 | `sm confirm <verb>` | Promote a staging entry to curated |
 | `sm demote <verb>` | Move a curated entry back to staging |
-| `sm list` | List curated entries |
+| `sm list [--detail] [--by-usage|--by-date] [pattern]` | List curated entries, with optional filter and sort |
 | `sm list --staging` | List staging entries |
-| `sm reindex` | Rebuild the embedding store from the current registry |
+| `sm reindex` | Rebuild the redb cache and embedding store from TOML registry |
 | `sm promote` | Run the promotion pass (decay, auto-promote, flag for review) |
 
 ---
@@ -56,7 +62,7 @@ When multiple candidates are close, a disambiguation prompt is shown on stderr. 
 
 ### Prerequisites
 
-- Rust ≥ 1.80 (for modern dependency resolution; see [Build Notes](#build-notes) for older toolchains)
+- Rust ≥ 1.80 (required by `redb` and `fastembed`; tested on 1.89)
 - A supported shell: Bash, Zsh, Fish, PowerShell, or Cmd
 
 ### Build and install
@@ -70,7 +76,8 @@ cp target/release/sm ~/.local/bin/   # Linux/Mac
 ### Wire up the shell hook
 
 ```bash
-sm init
+sm init           # prints the snippet for review
+sm init --write   # detects your rc file and appends it (idempotent)
 ```
 
 Paste the printed snippet into your shell's rc file. For Bash/Zsh it looks like:
@@ -122,18 +129,15 @@ Source trust levels: `declarative` → `inferred:<model>:<score>` → `confirmed
 
 ## TODOs / Roadmap
 
+Completed in earlier passes: `sm init --write`, `redb` integration, optional `fastembed` (MiniLM-L6-v2) embeddings, `sm edit`, `sm remove`, `sm rename`, plus bonus `sm run` and shell-hook `__record` capture.
+
 | Priority | Feature | Notes |
 |---|---|---|
-| 1 | `sm init --write` | Auto-detect rc file and append hook, instead of printing |
-| 2 | `redb` integration | Replace per-file JSON scan with O(1) key lookup |
-| 3 | Real embeddings | Swap `embed_text_bow` (BoW hash) for `fastembed` (ONNX transformer) |
-| 4 | `sm edit <verb>` | Open procedure in `$EDITOR` for in-place editing |
-| 5 | Native StepKinds in `wrap` | Currently `wrap` only captures `ShellRaw`; should infer typed steps |
-| 6 | Windows ConPTY testing | PowerShell hook path not yet end-to-end tested |
-| 7 | `sm remove <verb>` | Delete entry from registry and embedding store |
-| 8 | `sm rename <old> <new>` | Rename verb while preserving usage history |
-| 9 | Scheduled procedures | Cron-like execution of registered procedures |
-| 10 | Config file parser | Replace line-by-line model config parsing with `serde_json` |
+| 1 | Native `StepKind` inference in `wrap` | Currently `wrap` only captures `ShellRaw`; should detect curl/wget→`HttpCall`, cp→`FileCopy`, mv→`FileMove`, mkdir→`MkDir`, rm→`FileDelete`, export→`SetEnv`, echo→`Echo` |
+| 2 | Windows ConPTY testing | PowerShell hook path not yet end-to-end tested on a real Windows shell |
+| 3 | Scheduled procedures | Cron-like execution of registered procedures (new module) |
+| 4 | Config file parser | Replace line-by-line model config parsing with `serde_json` / `toml` |
+| 5 | Drop the rest of the version pins | `Cargo.toml` still has `=` pins from the Rust 1.75 sandbox era; modern toolchain doesn't need them |
 
 ---
 
@@ -143,13 +147,13 @@ Source trust levels: `declarative` → `inferred:<model>:<score>` → `confirmed
 src/
 ├── main.rs              Entry point, tokio runtime
 ├── platform/            OS abstraction (StepKind executor, path resolution, shell detection)
-├── registry/            Dual-store command registry (curated + staging), promotion policy
-├── embedder/            Flat binary embedding store, BoW hash embedder
-├── session/             Ring buffer of resolved commands (last 200)
+├── registry/            Dual-store command registry (curated + staging), promotion policy, redb cache
+├── embedder/            Flat binary embedding store; BoW default, fastembed (MiniLM) optional
+├── session/             Ring buffer of resolved + native commands (last 200)
 ├── disambiguator/       Re-ranking and interactive disambiguation prompt
-├── resolver/            4-stage resolution pipeline
+├── resolver/            4-stage resolution pipeline (redb fast path when warm)
 ├── model_client/        OpenAI-compatible inference client (curl subprocess)
-├── editor/              Stub — $EDITOR integration (not yet implemented)
+├── editor/              $EDITOR / $VISUAL integration, reload + re-embed on save
 └── cli/                 All user-facing command handlers
 ```
 
@@ -159,14 +163,16 @@ See [REFERENCE.md](REFERENCE.md) for the full public API, resolution pipeline tr
 
 ## Build notes
 
-**Pinned dependencies:** `Cargo.toml` uses exact `=` version pins targeting Rust 1.75. On Rust ≥ 1.80, remove the `=` prefixes and let Cargo resolve normally.
+**Pinned dependencies:** Most `Cargo.toml` entries still use exact `=` pins inherited from the Rust 1.75 sandbox era. They build cleanly on modern toolchains but the pins are noise — strip them at your leisure. `redb` and `fastembed` are already unpinned.
 
-**Crates stubbed out for sandbox constraints** (add back on a modern toolchain):
+**Build modes:**
+- `cargo build` — default; BoW embeddings (no ONNX download, fast compile)
+- `cargo build --no-default-features --features semantic-embeddings` — pulls in `fastembed` and downloads MiniLM-L6-v2 on first run
+
+**Crates still stubbed out** (add back when you want to upgrade those paths):
 - `reqwest` — replace the `curl` subprocess in `model_client`
 - `shellexpand` — replace the manual `expand_env()` in `platform/mod.rs`
 - `rustyline` — replace `std::io::stdin` readline in `cli/mod.rs` for history/completion
-- `fastembed` — replace `embed_text_bow()` for production-quality semantic search
-- `redb` — implement `registry/store.rs` for O(1) registry lookup
 
 ---
 
