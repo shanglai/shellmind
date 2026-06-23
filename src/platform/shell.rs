@@ -138,8 +138,8 @@ end
             ShellKind::PowerShell => r#"
 # shellmind hook — add to $PROFILE
 function sm {
-    $mgmt = @('init','hook','add','wrap','confirm','demote','list','reindex','promote','remove','rename','edit','run','resolve','__exec','help')
-    if ($mgmt -contains $args[0]) {
+    $mgmt = @('init','hook','add','wrap','confirm','demote','list','reindex','promote','remove','rename','edit','run','resolve','__exec','__record','help','--help','-h')
+    if ($args.Count -eq 0 -or $mgmt -contains $args[0]) {
         & (Get-Command sm -CommandType Application).Source @args
     } else {
         $result = & (Get-Command sm -CommandType Application).Source resolve @args 2>$null
@@ -148,6 +148,27 @@ function sm {
         } else {
             & (Get-Command sm -CommandType Application).Source @args
         }
+    }
+}
+# Record native shell commands so `sm wrap` can see them.
+# We wrap the user's `prompt` function (called before every prompt) and snapshot
+# the most recent history entry. Guarded against double-registration.
+if (-not $script:_SM_HOOK_LOADED) {
+    $script:_SM_HOOK_LOADED = $true
+    $script:_sm_orig_prompt = $function:prompt
+    $script:_sm_last_history_id = $null
+    function global:prompt {
+        try {
+            $hist = Get-History -Count 1 -ErrorAction SilentlyContinue
+            if ($hist -and $hist.Id -ne $script:_sm_last_history_id) {
+                $script:_sm_last_history_id = $hist.Id
+                $cmd = $hist.CommandLine
+                if ($cmd -and -not ($cmd -like 'sm *')) {
+                    & (Get-Command sm -CommandType Application).Source __record $cmd 2>$null | Out-Null
+                }
+            }
+        } catch {}
+        & $script:_sm_orig_prompt
     }
 }
 "#.to_string(),

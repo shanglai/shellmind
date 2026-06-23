@@ -200,23 +200,35 @@ fn default_rc_path(shell: &crate::platform::shell::ShellKind) -> Option<std::pat
         ShellKind::Zsh  => Some(home.join(".zshrc")),
         ShellKind::Fish => Some(home.join(".config").join("fish").join("config.fish")),
         ShellKind::PowerShell => powershell_profile_path().or_else(|| {
-            // Conventional fallback (Windows PowerShell 5.x)
-            Some(home.join("Documents").join("WindowsPowerShell").join("Microsoft.PowerShell_profile.ps1"))
+            // Conventional fallback: prefer PowerShell 7+ location if the
+            // directory exists; otherwise the Windows PowerShell 5.x path
+            let ps7 = home.join("Documents").join("PowerShell").join("Microsoft.PowerShell_profile.ps1");
+            if ps7.parent().map(|p| p.exists()).unwrap_or(false) {
+                Some(ps7)
+            } else {
+                Some(home.join("Documents").join("WindowsPowerShell").join("Microsoft.PowerShell_profile.ps1"))
+            }
         }),
         ShellKind::Cmd | ShellKind::Unknown(_) => None,
     }
 }
 
-/// Query the actual $PROFILE path from PowerShell. Returns None if PowerShell
-/// isn't on PATH or the query fails.
+/// Query the actual `$PROFILE` path from PowerShell. Tries `pwsh.exe`
+/// (PowerShell 7+) first and falls back to `powershell.exe` (Windows
+/// PowerShell 5.x). Returns None if neither is on PATH or both queries fail.
 fn powershell_profile_path() -> Option<std::path::PathBuf> {
-    let output = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-Command", "$PROFILE"])
-        .output()
-        .ok()?;
-    if !output.status.success() { return None; }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() { None } else { Some(std::path::PathBuf::from(path)) }
+    for exe in ["pwsh.exe", "powershell.exe"] {
+        let Ok(output) = std::process::Command::new(exe)
+            .args(["-NoProfile", "-Command", "$PROFILE"])
+            .output()
+        else { continue };
+        if !output.status.success() { continue; }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Some(std::path::PathBuf::from(path));
+        }
+    }
+    None
 }
 
 /// Minimal tilde expansion for the rc-path prompt — handles only a leading "~/".
