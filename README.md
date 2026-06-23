@@ -71,42 +71,99 @@ When multiple candidates are close, a disambiguation prompt is shown on stderr. 
 - Rust ≥ 1.80 (required by `redb` and `fastembed`; tested on 1.89)
 - A supported shell: Bash, Zsh, Fish, PowerShell, or Cmd
 
-### Build and install
+### Quick start (recommended)
 
 ```bash
-cargo build --release
-cp target/release/sm ~/.local/bin/   # Linux/Mac
-# Windows: copy target\release\sm.exe to a directory on your PATH
+# Build with the full recommended feature set
+# (~80MB MiniLM ONNX download on first run, ~2min cold compile)
+cargo build --release --no-default-features --features semantic-embeddings
+
+# Install on $PATH
+cp target/release/sm ~/.local/bin/             # Linux / Mac
+# Windows: copy target\release\sm.exe to any directory on PATH
+
+# Auto-detect your shell rc file and append the hook
+sm init --write
+exec $SHELL                                    # reload the shell
+
+# Optional but recommended: enable LLM-backed Stage-4 fallback
+export OPENAI_API_KEY=sk-...
 ```
+
+That gets you the full pipeline: MiniLM-L6-v2 embeddings for semantic
+search, redb O(1) verb lookup, native command capture for `sm wrap`, and
+LLM inference for unknown inputs. The MiniLM ONNX model is downloaded
+into the platform cache dir on the first semantic-embedding call.
+
+### Build options
+
+| Build command | Embeddings | First-run download | Cold compile | When to use |
+|---|---|---|---|---|
+| `cargo build --release --no-default-features --features semantic-embeddings` | **MiniLM-L6-v2** (384-dim) | ~80MB ONNX | ~2 min | **Recommended** — production-quality Stage-3 semantic similarity |
+| `cargo build --release` | BoW hash (512-dim) | none | ~30s | Quick iteration, CI, sandboxes, exact-match-heavy use |
+
+Both modes always include:
+
+- **`redb`** — O(1) verb lookup cache for Stage-1 / `sm list`
+- **Shell hook** for bash/zsh/fish/PowerShell with native command capture
+- **Scheduler** (`sm schedule …`) — cron-driven verb execution
+- **All 12 `StepKind` executors** for typed procedures
+
+Switching embedding modes requires `sm reindex` to rebuild `embeddings.bin`
+at the new vector dimension. The `--release` flag matters a lot for the
+semantic build — debug ONNX is unusably slow.
 
 ### Wire up the shell hook
 
 ```bash
 sm init           # prints the snippet for review
-sm init --write   # detects your rc file and appends it (idempotent)
+sm init --write   # auto-detects your rc file and appends (idempotent)
 ```
 
-Paste the printed snippet into your shell's rc file. For Bash/Zsh it looks like:
+`sm init` auto-detects bash/zsh/fish on Unix from `$SHELL`, and PowerShell
+on Windows via `$PROFILE` (preferring PowerShell 7+ over Windows
+PowerShell 5.x when both are present). Re-running `--write` on an
+already-installed rc file reports "Hook already installed" and exits
+cleanly.
 
-```bash
-function sm() {
-    local result
-    result=$(command sm resolve "$@" 2>/tmp/sm_err)
-    if [ $? -eq 0 ] && [ -n "$result" ]; then
-        eval "$result"
-    else
-        command sm "$@"
-    fi
-}
-```
+The installed hook also registers a `__record` capture via your shell's
+prompt mechanism (`PROMPT_COMMAND` on bash, `precmd_functions` on zsh,
+`fish_postexec` on fish, prompt-function wrapping on PowerShell) so
+`sm wrap last <N>` can see native commands that didn't go through `sm`.
 
 ### Optional: model inference (Stage 4)
 
-Set `OPENAI_API_KEY` (or equivalent for any OpenAI-compatible endpoint). The default model is `gpt-4o-mini`. No key = graceful passthrough; unknown inputs are passed to the shell unchanged.
+Set `OPENAI_API_KEY` (or equivalent for any OpenAI-compatible endpoint).
+The default model is `gpt-4o-mini`. Without a key, Stage 4 passes through
+unchanged — your shell sees the input verbatim.
+
+For a non-OpenAI endpoint, edit `~/.config/shellmind/shellmind.toml`:
+
+```toml
+model_name  = "your-model"
+api_base    = "https://your-endpoint/v1"
+api_key_env = "YOUR_API_KEY_VAR"
+```
+
+### Optional: schedule the cron tick
+
+For `sm schedule run` to actually fire due jobs, wire it into your OS
+scheduler:
+
+```bash
+# Unix cron — every minute:
+(crontab -l 2>/dev/null; echo "* * * * * $HOME/.local/bin/sm schedule run >/dev/null 2>&1") | crontab -
+```
+
+```powershell
+# Windows Task Scheduler:
+schtasks /create /sc minute /mo 1 /tn shellmind-tick /tr "C:\path\to\sm.exe schedule run"
+```
 
 ### Logging
 
-Set `SHELLMIND_LOG=debug` (or `info`, `warn`) to enable tracing output.
+Set `SHELLMIND_LOG=debug` (or `info`, `warn`) to enable tracing output to
+stderr.
 
 ---
 
@@ -170,16 +227,25 @@ See [REFERENCE.md](REFERENCE.md) for the full public API, resolution pipeline tr
 
 ## Build notes
 
-**Pinned dependencies:** Most `Cargo.toml` entries still use exact `=` pins inherited from the Rust 1.75 sandbox era. They build cleanly on modern toolchains but the pins are noise — strip them at your leisure. `redb` and `fastembed` are already unpinned.
+(Build modes and feature combinations live in the [Setup](#setup) section
+above. This section covers what's still stubbed and the legacy version
+pinning.)
 
-**Build modes:**
-- `cargo build` — default; BoW embeddings (no ONNX download, fast compile)
-- `cargo build --no-default-features --features semantic-embeddings` — pulls in `fastembed` and downloads MiniLM-L6-v2 on first run
+**Pinned dependencies:** Most `Cargo.toml` entries still carry exact `=`
+pins inherited from a Rust 1.75 sandbox. They build cleanly on modern
+toolchains but the pins are noise — strip them at your leisure. `redb`,
+`fastembed`, and `cron` are already unpinned.
 
-**Crates still stubbed out** (add back when you want to upgrade those paths):
-- `reqwest` — replace the `curl` subprocess in `model_client`
-- `shellexpand` — replace the manual `expand_env()` in `platform/mod.rs`
-- `rustyline` — replace `std::io::stdin` readline in `cli/mod.rs` for history/completion
+**Crates still stubbed out** (upgrade when convenient):
+
+- **`reqwest`** — would replace the `curl` subprocess in `model_client`
+  and unblock real HTTP for `StepKind::HttpCall`. Currently HTTP steps
+  log a warning and return failure.
+- **`shellexpand`** — would replace the manual `expand_env()` in
+  `platform/mod.rs`.
+- **`rustyline`** — would replace `std::io::stdin` readline in
+  `cli/mod.rs` for history + tab completion in interactive prompts
+  (`sm add proc`, `sm wrap`, disambiguator).
 
 ---
 
