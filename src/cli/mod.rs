@@ -22,6 +22,7 @@ use crate::registry::promotion::PromotionPolicy;
 use crate::registry::store::RegistryStore;
 use crate::embedder::EMBED_DIM;
 use crate::resolver::{Resolver, Resolution};
+use crate::scheduler::{Schedule, ScheduleStore};
 use crate::session::{SessionBuffer, build_wrap_preview, finalize_wrap};
 
 pub async fn dispatch(args: Vec<String>, paths: ShellmindPaths, shell_env: ShellEnv) -> Result<()> {
@@ -84,6 +85,7 @@ pub async fn dispatch(args: Vec<String>, paths: ShellmindPaths, shell_env: Shell
             let slots: Vec<String> = args[3..].to_vec();
             cmd_run(verb, &slots, &paths).await
         }
+        "schedule" => cmd_schedule(&args[2..], &paths).await,
         "__record" => {
             // Called by the shell PROMPT_COMMAND hook to capture native commands
             let cmd = args[2..].join(" ");
@@ -609,14 +611,33 @@ fn cmd_remove(verb: &str, paths: &ShellmindPaths) -> Result<()> {
 }
 
 async fn cmd_run(verb: &str, slots: &[String], paths: &ShellmindPaths) -> Result<()> {
+    let entry = load_entry(verb, paths)?;
+    let outcome = run_entry(&entry, slots).await?;
+    if !outcome.success {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Result of running a single `CommandEntry`. Shared by `cmd_run` (CLI) and
+/// the scheduler. The scheduler needs to *not* exit on failure so it can
+/// continue running other due schedules, hence the explicit struct return.
+struct RunOutcome {
+    success: bool,
+    #[allow(dead_code)] succeeded: usize,
+    #[allow(dead_code)] total: usize,
+}
+
+fn load_entry(verb: &str, paths: &ShellmindPaths) -> Result<CommandEntry> {
     let registry = build_registry(paths);
     let mut all = registry.load_all_from_dir(&registry.curated_dir)?;
     all.extend(registry.load_all_from_dir(&registry.staging_dir)?);
-
-    let entry = all.into_iter()
+    all.into_iter()
         .find(|e| e.verb == verb)
-        .with_context(|| format!("'{}' not found in registry.", verb))?;
+        .with_context(|| format!("'{}' not found in registry.", verb))
+}
 
+async fn run_entry(entry: &CommandEntry, slots: &[String]) -> Result<RunOutcome> {
     match &entry.kind {
         EntryKind::Alias { expansion, arg_names } => {
             let mut cmd = expansion.clone();
@@ -630,13 +651,12 @@ async fn cmd_run(verb: &str, slots: &[String], paths: &ShellmindPaths) -> Result
             let status = tokio::process::Command::new(program)
                 .arg(flag).arg(&cmd)
                 .status().await?;
-            if !status.success() {
-                std::process::exit(status.code().unwrap_or(1));
-            }
+            let success = status.success();
+            Ok(RunOutcome { success, succeeded: if success { 1 } else { 0 }, total: 1 })
         }
         EntryKind::Procedure { steps, .. } => {
             if steps.is_empty() {
-                anyhow::bail!("'{}' has no steps to run.", verb);
+                anyhow::bail!("'{}' has no steps to run.", entry.verb);
             }
             let total = steps.len();
             let step_kinds: Vec<_> = steps.iter().map(|s| s.step.clone()).collect();
@@ -645,7 +665,6 @@ async fn cmd_run(verb: &str, slots: &[String], paths: &ShellmindPaths) -> Result
             }).collect();
 
             let mut exec = Executor::new(Platform::current());
-            let mut outputs: Vec<Option<String>> = vec![];
             let mut succeeded = 0usize;
 
             for (i, step) in step_kinds.iter().enumerate() {
@@ -658,16 +677,198 @@ async fn cmd_run(verb: &str, slots: &[String], paths: &ShellmindPaths) -> Result
                 } else {
                     eprintln!("\x1b[31m✗\x1b[0m");
                 }
-                outputs.push(r.output.clone());
             }
 
             let color = if succeeded == total { "\x1b[32m" } else { "\x1b[33m" };
             eprintln!("  {}Done. ({}/{} steps succeeded)\x1b[0m", color, succeeded, total);
-            if succeeded < total {
-                std::process::exit(1);
-            }
+            Ok(RunOutcome { success: succeeded == total, succeeded, total })
         }
     }
+}
+
+// ── sm schedule ──────────────────────────────────────────────────────────────
+
+async fn cmd_schedule(rest: &[String], paths: &ShellmindPaths) -> Result<()> {
+    let action = rest.first().map(|s| s.as_str()).unwrap_or("list");
+    match action {
+        "add"     => cmd_schedule_add(&rest[1..], paths),
+        "list"    => cmd_schedule_list(paths),
+        "remove" | "rm" => {
+            let name = rest.get(1).context("Usage: sm schedule remove <name>")?;
+            cmd_schedule_remove(name, paths)
+        }
+        "enable"  => {
+            let name = rest.get(1).context("Usage: sm schedule enable <name>")?;
+            cmd_schedule_set_enabled(name, true, paths)
+        }
+        "disable" => {
+            let name = rest.get(1).context("Usage: sm schedule disable <name>")?;
+            cmd_schedule_set_enabled(name, false, paths)
+        }
+        "next"    => cmd_schedule_next(paths),
+        "run"     => cmd_schedule_run(paths).await,
+        _ => anyhow::bail!("Usage: sm schedule <add|list|remove|enable|disable|next|run> ..."),
+    }
+}
+
+fn cmd_schedule_add(rest: &[String], paths: &ShellmindPaths) -> Result<()> {
+    if rest.len() < 3 {
+        anyhow::bail!("Usage: sm schedule add <name> \"<cron>\" <verb> [args...]");
+    }
+    let name = &rest[0];
+    let cron = &rest[1];
+    let verb = &rest[2];
+    let args: Vec<String> = rest[3..].to_vec();
+
+    // Validate verb exists
+    let _ = load_entry(verb, paths)
+        .with_context(|| format!("Cannot schedule unknown verb '{}'", verb))?;
+
+    let store = ScheduleStore::new(&paths.schedules_dir);
+    if store.get(name)?.is_some() {
+        anyhow::bail!("Schedule '{}' already exists. Remove it first or pick another name.", name);
+    }
+
+    let schedule = Schedule::new(name, verb, args, cron)?;
+    store.put(&schedule)?;
+
+    println!("  \x1b[32m✓\x1b[0m Scheduled '{}' to run '{}' on cron '{}'.", name, verb, cron);
+    if let Some(nr) = schedule.next_run {
+        println!("    Next run: \x1b[33m{}\x1b[0m", nr.format("%Y-%m-%d %H:%M UTC"));
+    }
+    Ok(())
+}
+
+fn cmd_schedule_list(paths: &ShellmindPaths) -> Result<()> {
+    let store = ScheduleStore::new(&paths.schedules_dir);
+    let schedules = store.load_all()?;
+
+    if schedules.is_empty() {
+        println!("No schedules. Add one with `sm schedule add <name> \"<cron>\" <verb> [args...]`.");
+        return Ok(());
+    }
+
+    println!("\n  \x1b[1mSCHEDULES\x1b[0m  \x1b[90m{} entries\x1b[0m\n", schedules.len());
+    println!("  {:<20} {:<14} {:<16} {:<8} {}", "NAME", "CRON", "VERB", "ENABLED", "NEXT RUN");
+    println!("  {}", "-".repeat(80));
+    for s in &schedules {
+        let next = if !s.enabled {
+            "\x1b[90m(disabled)\x1b[0m".to_string()
+        } else if let Some(nr) = s.next_run {
+            nr.format("%Y-%m-%d %H:%M UTC").to_string()
+        } else {
+            "—".to_string()
+        };
+        println!("  {:<20} {:<14} {:<16} {:<8} {}",
+            s.name, s.cron, s.verb,
+            if s.enabled { "yes" } else { "no" },
+            next);
+    }
+    println!();
+    Ok(())
+}
+
+fn cmd_schedule_remove(name: &str, paths: &ShellmindPaths) -> Result<()> {
+    let store = ScheduleStore::new(&paths.schedules_dir);
+    if !store.delete(name)? {
+        anyhow::bail!("Schedule '{}' not found.", name);
+    }
+    println!("  \x1b[32m✓\x1b[0m Removed schedule '{}'.", name);
+    Ok(())
+}
+
+fn cmd_schedule_set_enabled(name: &str, enabled: bool, paths: &ShellmindPaths) -> Result<()> {
+    let store = ScheduleStore::new(&paths.schedules_dir);
+    let mut sched = store.get(name)?
+        .with_context(|| format!("Schedule '{}' not found", name))?;
+    sched.enabled = enabled;
+    // When re-enabling, recompute next_run so we don't immediately fire on a
+    // stale timestamp from when it was disabled.
+    if enabled {
+        sched.next_run = sched.compute_next_after(chrono::Utc::now())?;
+    }
+    store.put(&sched)?;
+    println!("  \x1b[32m✓\x1b[0m Schedule '{}' is now \x1b[33m{}\x1b[0m.", name,
+        if enabled { "enabled" } else { "disabled" });
+    Ok(())
+}
+
+fn cmd_schedule_next(paths: &ShellmindPaths) -> Result<()> {
+    let store = ScheduleStore::new(&paths.schedules_dir);
+    let mut schedules: Vec<Schedule> = store.load_all()?
+        .into_iter()
+        .filter(|s| s.enabled && s.next_run.is_some())
+        .collect();
+    schedules.sort_by_key(|s| s.next_run.unwrap());
+
+    if schedules.is_empty() {
+        println!("No upcoming schedule runs.");
+        return Ok(());
+    }
+
+    println!("\n  Upcoming:");
+    for s in &schedules {
+        let args = if s.args.is_empty() { String::new() } else { format!(" {}", s.args.join(" ")) };
+        println!("    \x1b[33m{}\x1b[0m  {:<20} \x1b[90m{}{}\x1b[0m",
+            s.next_run.unwrap().format("%Y-%m-%d %H:%M UTC"),
+            s.name, s.verb, args);
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_schedule_run(paths: &ShellmindPaths) -> Result<()> {
+    let store = ScheduleStore::new(&paths.schedules_dir);
+    let schedules = store.load_all()?;
+    let now = chrono::Utc::now();
+
+    let due: Vec<Schedule> = schedules.into_iter().filter(|s| s.is_due(now)).collect();
+
+    if due.is_empty() {
+        eprintln!("No schedules due as of {}.", now.format("%Y-%m-%d %H:%M:%S UTC"));
+        return Ok(());
+    }
+
+    eprintln!("\n  Found {} due schedule(s).\n", due.len());
+
+    let mut ran = 0usize;
+    let mut succeeded = 0usize;
+
+    for mut sched in due {
+        let args_str = if sched.args.is_empty() { String::new() } else { format!(" {}", sched.args.join(" ")) };
+        eprintln!("  \x1b[1m▶\x1b[0m '{}' \x1b[90m({}{})\x1b[0m",
+            sched.name, sched.verb, args_str);
+
+        let entry = match load_entry(&sched.verb, paths) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("    \x1b[31m✗\x1b[0m verb missing: {}", e);
+                ran += 1;
+                // Still update next_run so we don't loop on a broken schedule
+                sched.last_run = Some(now);
+                sched.next_run = sched.compute_next_after(now).ok().flatten();
+                let _ = store.put(&sched);
+                continue;
+            }
+        };
+
+        let outcome = run_entry(&entry, &sched.args).await;
+        ran += 1;
+        match outcome {
+            Ok(o) if o.success => succeeded += 1,
+            Ok(_) => {}
+            Err(e) => eprintln!("    \x1b[31m✗\x1b[0m run failed: {}", e),
+        }
+
+        sched.last_run = Some(now);
+        sched.next_run = sched.compute_next_after(now).ok().flatten();
+        if let Err(e) = store.put(&sched) {
+            tracing::warn!("Could not persist schedule '{}': {}", sched.name, e);
+        }
+    }
+
+    let color = if succeeded == ran { "\x1b[32m" } else { "\x1b[33m" };
+    eprintln!("\n  {}✓\x1b[0m Ran {} schedule(s), {} succeeded.\n", color, ran, succeeded);
     Ok(())
 }
 
@@ -858,6 +1059,15 @@ COMMANDS
                            sort by usage or date (default: alphabetical).
   reindex                  Rebuild embedding store from registry
   promote                  Run automatic promotion/decay pass
+
+  schedule add <name> "<cron>" <verb> [args...]
+                           Schedule a verb to run on a 5-field cron expression
+  schedule list            List configured schedules
+  schedule remove <name>   Delete a schedule
+  schedule enable|disable <name>
+                           Toggle a schedule without removing it
+  schedule next            Show upcoming runs sorted by time
+  schedule run             Run all due schedules now (wire into cron/Task Scheduler)
 
 REGISTRY FILES
   Curated  ~/.config/shellmind/registry/curated/   (TOML, hand-editable)

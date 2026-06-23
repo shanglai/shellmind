@@ -18,6 +18,8 @@ pub struct ShellmindPaths {
     pub embeddings_bin: PathBuf,
     /// config_dir/session/history.bin — ring buffer persistence
     pub session_history: PathBuf,
+    /// config_dir/schedules/         — scheduled procedure definitions
+    pub schedules_dir: PathBuf,
     /// config_dir/shellmind.toml      — user config
     pub user_config: PathBuf,
 }
@@ -38,6 +40,7 @@ impl ShellmindPaths {
             staging_db: db.join("staging.redb"),
             embeddings_bin: db.join("embeddings.bin"),
             session_history: config_dir.join("session").join("history.bin"),
+            schedules_dir: config_dir.join("schedules"),
             user_config: config_dir.join("shellmind.toml"),
             config_dir,
         })
@@ -49,6 +52,7 @@ impl ShellmindPaths {
             &self.config_dir,
             &self.curated_toml_dir,
             &self.staging_toml_dir,
+            &self.schedules_dir,
             self.curated_db.parent().unwrap(),
             self.session_history.parent().unwrap(),
         ] {
