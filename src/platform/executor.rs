@@ -14,11 +14,19 @@ pub struct StepResult {
 pub struct Executor {
     platform: Platform,
     env_overlay: HashMap<String, String>,
+    /// When true, stdio is inherited — steps run transparently in the terminal.
+    /// Use for interactive hook execution (sm __exec). False for sm run (captured output).
+    pub interactive: bool,
 }
 
 impl Executor {
     pub fn new(platform: Platform) -> Self {
-        Self { platform, env_overlay: HashMap::new() }
+        Self { platform, env_overlay: HashMap::new(), interactive: false }
+    }
+
+    pub fn interactive(mut self) -> Self {
+        self.interactive = true;
+        self
     }
 
     pub async fn run_steps(
@@ -179,10 +187,17 @@ impl Executor {
             c
         };
         for (k, v) in &self.env_overlay { command.env(k, v); }
-        let out = command.output().await?;
-        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-        if !stdout.is_empty() { print!("{}", stdout); }
-        Ok(StepResult { success: out.status.success(), output: Some(stdout), exit_code: out.status.code() })
+
+        if self.interactive {
+            // Inherit stdio — output flows directly to the terminal, no buffering
+            let status = command.status().await?;
+            Ok(StepResult { success: status.success(), output: None, exit_code: status.code() })
+        } else {
+            let out = command.output().await?;
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            if !stdout.is_empty() { print!("{}", stdout); }
+            Ok(StepResult { success: out.status.success(), output: Some(stdout), exit_code: out.status.code() })
+        }
     }
 }
 

@@ -52,46 +52,102 @@ impl ShellEnv {
             ShellKind::Bash => r#"
 # shellmind hook — add to ~/.bashrc
 function sm() {
-    local result
-    result=$(command sm resolve "$@" 2>/tmp/sm_err)
-    if [ $? -eq 0 ] && [ -n "$result" ]; then
-        eval "$result"
-    else
-        command sm "$@"
-    fi
+    case "$1" in
+        init|hook|add|wrap|confirm|demote|list|reindex|promote|remove|rename|edit|run|resolve|__exec|__record|help|--help|-h)
+            command sm "$@"
+            ;;
+        *)
+            local result
+            result=$(command sm resolve "$@" 2>/tmp/sm_err)
+            if [ $? -eq 0 ] && [ -n "$result" ]; then
+                eval "$result"
+            else
+                command sm "$@"
+            fi
+            ;;
+    esac
 }
+# Record native shell commands so `sm wrap` can see them
+_sm_record_last_cmd() {
+    local last_cmd
+    last_cmd=$(HISTTIMEFORMAT= history 1 | sed 's/^[ ]*[0-9]*[ ]*//')
+    [[ "$last_cmd" == sm\ * || -z "$last_cmd" ]] && return 0
+    command sm __record "$last_cmd" 2>/dev/null
+    return 0
+}
+# Guard prevents double-registration when .bashrc is sourced multiple times
+if [[ -z "$_SM_HOOK_LOADED" ]]; then
+    export _SM_HOOK_LOADED=1
+    PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }_sm_record_last_cmd"
+fi
 "#.to_string(),
             ShellKind::Zsh => r#"
 # shellmind hook — add to ~/.zshrc
 function sm() {
-    local result
-    result=$(command sm resolve "$@" 2>/tmp/sm_err)
-    if [[ $? -eq 0 ]] && [[ -n "$result" ]]; then
-        eval "$result"
-    else
-        command sm "$@"
-    fi
+    case "$1" in
+        init|hook|add|wrap|confirm|demote|list|reindex|promote|remove|rename|edit|run|resolve|__exec|__record|help|--help|-h)
+            command sm "$@"
+            ;;
+        *)
+            local result
+            result=$(command sm resolve "$@" 2>/tmp/sm_err)
+            if [[ $? -eq 0 ]] && [[ -n "$result" ]]; then
+                eval "$result"
+            else
+                command sm "$@"
+            fi
+            ;;
+    esac
 }
+# Record native shell commands so `sm wrap` can see them
+_sm_record_last_cmd() {
+    local last_cmd
+    last_cmd=$(fc -ln -1 2>/dev/null | sed 's/^[[:space:]]*//')
+    [[ "$last_cmd" == sm\ * || -z "$last_cmd" ]] && return 0
+    command sm __record "$last_cmd" 2>/dev/null
+    return 0
+}
+if (( ! ${+_SM_HOOK_LOADED} )); then
+    export _SM_HOOK_LOADED=1
+    precmd_functions+=(_sm_record_last_cmd)
+fi
 "#.to_string(),
             ShellKind::Fish => r#"
 # shellmind hook — add to ~/.config/fish/config.fish
 function sm
-    set result (command sm resolve $argv 2>/tmp/sm_err)
-    if test $status -eq 0; and test -n "$result"
-        eval $result
-    else
+    switch $argv[1]
+    case init hook add wrap confirm demote list reindex promote remove rename edit run resolve __exec __record help
         command sm $argv
+    case '*'
+        set result (command sm resolve $argv 2>/tmp/sm_err)
+        if test $status -eq 0; and test -n "$result"
+            eval $result
+        else
+            command sm $argv
+        end
     end
+end
+# Record native shell commands so `sm wrap` can see them
+function _sm_record_last_cmd --on-event fish_postexec
+    set -l cmd $argv[1]
+    string match -q 'sm *' $cmd; and return
+    test -z "$cmd"; and return
+    command sm __record $cmd 2>/dev/null
 end
 "#.to_string(),
             ShellKind::PowerShell => r#"
 # shellmind hook — add to $PROFILE
 function sm {
-    $result = & (Get-Command sm -CommandType Application).Source resolve @args 2>$null
-    if ($LASTEXITCODE -eq 0 -and $result) {
-        Invoke-Expression $result
-    } else {
+    $mgmt = @('init','hook','add','wrap','confirm','demote','list','reindex','promote','remove','rename','edit','run','resolve','__exec','help')
+    if ($mgmt -contains $args[0]) {
         & (Get-Command sm -CommandType Application).Source @args
+    } else {
+        $result = & (Get-Command sm -CommandType Application).Source resolve @args 2>$null
+        if ($LASTEXITCODE -eq 0 -and $result) {
+            Invoke-Expression $result
+        } else {
+            & (Get-Command sm -CommandType Application).Source @args
+        }
     }
 }
 "#.to_string(),

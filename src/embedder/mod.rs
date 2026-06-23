@@ -7,6 +7,13 @@
 pub const MAGIC: u32 = 0x534D454D; // "SMEM"
 pub const VERSION: u32 = 1;
 
+/// Embedding dimension — 384 for MiniLM-L6-v2, 512 for bag-of-words fallback.
+/// Switching features requires `sm reindex` to rebuild embeddings.bin.
+#[cfg(feature = "semantic-embeddings")]
+pub const EMBED_DIM: usize = 384;
+#[cfg(not(feature = "semantic-embeddings"))]
+pub const EMBED_DIM: usize = 512;
+
 #[derive(Debug, Clone)]
 pub struct EmbeddingEntry {
     pub verb: String,
@@ -134,8 +141,50 @@ fn ru32(buf: &[u8], p: &mut usize) -> anyhow::Result<u32> {
     Ok(u32::from_le_bytes(b))
 }
 
+/// Unified embed entry point. Uses semantic embeddings when the feature is active,
+/// falls back to BOW on init failure.
+pub fn embed_text(text: &str, dim: usize) -> Vec<f32> {
+    #[cfg(feature = "semantic-embeddings")]
+    if let Some(v) = fastembed_embed(text) {
+        return v;
+    }
+    embed_text_bow(text, dim)
+}
+
+// ── fastembed backend (semantic-embeddings feature) ───────────────────────────
+
+#[cfg(feature = "semantic-embeddings")]
+static SEMANTIC_MODEL: std::sync::OnceLock<
+    Option<std::sync::Mutex<fastembed::TextEmbedding>>
+> = std::sync::OnceLock::new();
+
+#[cfg(feature = "semantic-embeddings")]
+fn semantic_model() -> Option<&'static std::sync::Mutex<fastembed::TextEmbedding>> {
+    SEMANTIC_MODEL.get_or_init(|| {
+        fastembed::TextEmbedding::try_new(
+            fastembed::InitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2)
+                .with_show_download_progress(false),
+        )
+        .map_err(|e| tracing::warn!("fastembed init failed, using BOW: {}", e))
+        .ok()
+        .map(std::sync::Mutex::new)
+    })
+    .as_ref()
+}
+
+#[cfg(feature = "semantic-embeddings")]
+fn fastembed_embed(text: &str) -> Option<Vec<f32>> {
+    let model = semantic_model()?;
+    let guard = model.lock().ok()?;
+    let mut results = guard.embed(vec![text], None)
+        .map_err(|e| tracing::warn!("fastembed embed failed: {}", e))
+        .ok()?;
+    results.pop()
+}
+
+// ── Bag-of-words fallback ─────────────────────────────────────────────────────
+
 /// Bag-of-words embedding — bootstrap without ONNX.
-/// Replace inner loop with fastembed call when toolchain allows.
 pub fn embed_text_bow(text: &str, dim: usize) -> Vec<f32> {
     let mut vec = vec![0.0f32; dim];
     for token in text.split_whitespace() {

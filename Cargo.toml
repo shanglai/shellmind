@@ -18,6 +18,13 @@ tracing-subscriber = { version = "=0.3.18", features = ["env-filter"] }
 uuid = { version = "=1.7.0", features = ["v4", "serde"] }
 chrono = { version = "=0.4.31", features = ["serde"] }
 dirs = "=5.0.1"
+redb = "2"
+fastembed = { version = "3", optional = true }
+
+[features]
+default = ["bow-embeddings"]
+bow-embeddings = []
+semantic-embeddings = ["dep:fastembed"]
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "=0.27.1", features = ["process", "signal", "term"] }

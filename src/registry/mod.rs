@@ -145,11 +145,15 @@ impl CommandEntry {
                     map.insert("description".into(), serde_json::Value::String(d.clone()));
                 }
                 let steps_json: Vec<serde_json::Value> = steps.iter().map(|s| {
-                    serde_json::json!({
-                        "index": s.index,
-                        "description": s.description,
-                        "depends_on": s.depends_on,
-                    })
+                    // Serialize the full StepKind, then merge metadata fields into the same object
+                    let mut obj = serde_json::to_value(&s.step)
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                    if let Some(m) = obj.as_object_mut() {
+                        m.insert("index".into(), serde_json::json!(s.index));
+                        m.insert("description".into(), serde_json::json!(s.description));
+                        m.insert("depends_on".into(), serde_json::json!(s.depends_on));
+                    }
+                    obj
                 }).collect();
                 map.insert("steps".into(), serde_json::json!(steps_json));
                 let bindings_json: Vec<serde_json::Value> = arg_bindings.iter().map(|b| {
@@ -215,12 +219,22 @@ impl Registry {
         Ok(entries)
     }
 
+    /// Parse a `CommandEntry` from a JSON string (same format as on-disk TOML files).
+    /// Used by the redb store to deserialize entries without a file path.
+    pub fn parse_entry_json(json: &str) -> Result<CommandEntry> {
+        let v: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| anyhow::anyhow!("Cannot parse entry JSON: {}", e))?;
+        Self::entry_from_value(v)
+    }
+
     fn load_toml(&self, path: &Path) -> Result<CommandEntry> {
         let raw = std::fs::read_to_string(path)?;
-        let v: serde_json::Value = serde_json::from_str(&raw).or_else(|_| {
-            // Legacy: try parsing as simple key=value
-            Err(anyhow::anyhow!("Cannot parse registry file"))
-        })?;
+        let v: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|_| anyhow::anyhow!("Cannot parse registry file"))?;
+        Self::entry_from_value(v)
+    }
+
+    fn entry_from_value(v: serde_json::Value) -> Result<CommandEntry> {
         let table = v.as_object().context("Expected JSON object")?;
 
         let verb = table.get("verb").unwrap_or(&serde_json::Value::Null).as_str().context("verb")?.to_string();
@@ -242,7 +256,6 @@ impl Registry {
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
 
-        // Determine kind: expansion → Alias, steps → Procedure
         let kind = if let Some(expansion) = table.get("expansion").and_then(|v| v.as_str()) {
             let arg_names = table.get("arg_names")
                 .and_then(|v| v.as_array())
@@ -250,26 +263,42 @@ impl Registry {
                 .unwrap_or_default();
             EntryKind::Alias { expansion: expansion.to_string(), arg_names }
         } else {
-            // Minimal procedure stub — full deserialization left for later
+            let steps = table.get("steps")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter().enumerate().filter_map(|(i, sv)| {
+                        let step: StepKind = serde_json::from_value(sv.clone()).ok()?;
+                        let index = sv.get("index").and_then(|v| v.as_u64()).unwrap_or(i as u64) as usize;
+                        let description = sv.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let depends_on = sv.get("depends_on")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                            .unwrap_or_default();
+                        Some(ProcStep { index, step, description, depends_on })
+                    }).collect()
+                })
+                .unwrap_or_default();
+            let arg_bindings = table.get("arg_bindings")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter().filter_map(|bv| {
+                        Some(ArgBind {
+                            call_position: bv.get("call_position").and_then(|v| v.as_u64())? as usize,
+                            label: bv.get("label").and_then(|v| v.as_str())?.to_string(),
+                            step_index: bv.get("step_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                            placeholder: bv.get("placeholder").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        })
+                    }).collect()
+                })
+                .unwrap_or_default();
             EntryKind::Procedure {
-                steps: vec![],
-                arg_bindings: vec![],
+                steps,
+                arg_bindings,
                 description: table.get("description").and_then(|v| v.as_str()).map(|s| s.to_string()),
             }
         };
 
-        Ok(CommandEntry {
-            id,
-            verb,
-            kind,
-            tags,
-            source,
-            usage_count,
-            created_at,
-            last_used: None,
-            confidence,
-            embedding: None,
-        })
+        Ok(CommandEntry { id, verb, kind, tags, source, usage_count, created_at, last_used: None, confidence, embedding: None })
     }
 }
 

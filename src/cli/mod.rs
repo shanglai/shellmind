@@ -14,12 +14,14 @@
 
 use anyhow::{Context, Result};
 
-use crate::embedder::{EmbeddingStore, embed_text_bow};
+use crate::embedder::{EmbeddingStore, embed_text};
 use crate::model_client::{ModelClient, ModelConfig};
 use crate::platform::{Platform, executor::Executor, paths::ShellmindPaths, shell::ShellEnv};
 use crate::registry::{CommandEntry, EntryKind, Registry};
 use crate::registry::promotion::PromotionPolicy;
-use crate::resolver::{Resolver, Resolution, EMBED_DIM};
+use crate::registry::store::RegistryStore;
+use crate::embedder::EMBED_DIM;
+use crate::resolver::{Resolver, Resolution};
 use crate::session::{SessionBuffer, build_wrap_preview, finalize_wrap};
 
 pub async fn dispatch(args: Vec<String>, paths: ShellmindPaths, shell_env: ShellEnv) -> Result<()> {
@@ -27,7 +29,7 @@ pub async fn dispatch(args: Vec<String>, paths: ShellmindPaths, shell_env: Shell
 
     match subcmd {
         // ── Setup ────────────────────────────────────────────────────────────
-        "init" => cmd_init(&paths, &shell_env),
+        "init" => cmd_init(&args[2..], &paths, &shell_env),
 
         "hook" => {
             println!("{}", shell_env.hook_snippet());
@@ -61,12 +63,43 @@ pub async fn dispatch(args: Vec<String>, paths: ShellmindPaths, shell_env: Shell
             let verb = args.get(2).context("Usage: sm demote <verb>")?;
             cmd_demote(verb, &paths)
         }
-        "list" => {
-            let staging = args.get(2).map(|a| a == "--staging").unwrap_or(false);
-            cmd_list(staging, &paths)
-        }
+        "list" => cmd_list(&args[2..], &paths),
         "reindex" => cmd_reindex(&paths),
         "promote" => cmd_promote(&paths),
+        "remove" => {
+            let verb = args.get(2).context("Usage: sm remove <verb>")?;
+            cmd_remove(verb, &paths)
+        }
+        "rename" => {
+            let old = args.get(2).context("Usage: sm rename <old> <new>")?;
+            let new = args.get(3).context("Usage: sm rename <old> <new>")?;
+            cmd_rename(old, new, &paths)
+        }
+        "edit" => {
+            let verb = args.get(2).context("Usage: sm edit <verb>")?;
+            cmd_edit(verb, &paths)
+        }
+        "run" => {
+            let verb = args.get(2).context("Usage: sm run <verb> [args...]")?;
+            let slots: Vec<String> = args[3..].to_vec();
+            cmd_run(verb, &slots, &paths).await
+        }
+        "__record" => {
+            // Called by the shell PROMPT_COMMAND hook to capture native commands
+            let cmd = args[2..].join(" ");
+            if !cmd.is_empty() {
+                let mut session = SessionBuffer::load_or_create(&paths.session_history)?;
+                // Skip if identical to last recorded entry (guards against double PROMPT_COMMAND)
+                let is_dup = session.entries.back()
+                    .map(|e| e.raw_input == cmd)
+                    .unwrap_or(false);
+                if !is_dup {
+                    session.record(&cmd, &cmd, 0, None);
+                    let _ = session.save();
+                }
+            }
+            Ok(())
+        }
 
         "help" | "--help" | "-h" => { print_help(); Ok(()) }
         _ => {
@@ -79,13 +112,121 @@ pub async fn dispatch(args: Vec<String>, paths: ShellmindPaths, shell_env: Shell
 
 // ── Subcommand handlers ───────────────────────────────────────────────────────
 
-fn cmd_init(paths: &ShellmindPaths, shell_env: &ShellEnv) -> Result<()> {
+fn cmd_init(rest: &[String], paths: &ShellmindPaths, shell_env: &ShellEnv) -> Result<()> {
+    use crate::platform::shell::ShellKind;
+
     paths.ensure_dirs()?;
-    println!("✓ shellmind initialized at {}", paths.config_dir.display());
-    println!("\nAdd this to your shell rc file:\n");
-    println!("{}", shell_env.hook_snippet());
-    println!("Then reload your shell or run: source ~/.bashrc  (or equivalent)");
+    eprintln!("\x1b[32m✓\x1b[0m shellmind initialized at \x1b[90m{}\x1b[0m", paths.config_dir.display());
+
+    let write_flag = rest.iter().any(|a| a == "--write");
+    let snippet = shell_env.hook_snippet();
+
+    // Locate rc file: shell-derived default, with stdin fallback if shell is unknown
+    let rc_path = match default_rc_path(&shell_env.shell_kind) {
+        Some(p) => p,
+        None => {
+            eprintln!("\x1b[33m!\x1b[0m Could not auto-detect your shell rc file.");
+            eprintln!("  Detected shell: {:?}", shell_env.shell_kind);
+            eprint!("  Enter rc file path (or blank to skip): ");
+            std::io::Write::flush(&mut std::io::stderr()).ok();
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).ok();
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                eprintln!("\nAdd this to your shell rc file manually:\n");
+                eprintln!("{}", snippet);
+                return Ok(());
+            }
+            std::path::PathBuf::from(shellexpand_tilde(trimmed))
+        }
+    };
+
+    // Check whether hook already installed
+    let existing = std::fs::read_to_string(&rc_path).unwrap_or_default();
+    if existing.contains("shellmind hook") || existing.contains("sm resolve") {
+        eprintln!("\x1b[32m✓\x1b[0m Hook already installed in \x1b[90m{}\x1b[0m", rc_path.display());
+        return Ok(());
+    }
+
+    if !write_flag {
+        eprintln!("\nDetected rc file: \x1b[90m{}\x1b[0m", rc_path.display());
+        eprintln!("Add this snippet to it (or rerun with \x1b[33m--write\x1b[0m to append automatically):\n");
+        eprintln!("{}", snippet);
+        return Ok(());
+    }
+
+    // Append with a comment header for traceability
+    if let Some(parent) = rc_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create parent directory: {}", parent.display()))?;
+    }
+    let header = format!(
+        "\n# ── shellmind hook (added {}) ──\n",
+        chrono::Utc::now().format("%Y-%m-%d")
+    );
+    let mut to_append = String::with_capacity(header.len() + snippet.len() + 1);
+    to_append.push_str(&header);
+    to_append.push_str(&snippet);
+    if !to_append.ends_with('\n') { to_append.push('\n'); }
+
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&rc_path)
+        .with_context(|| format!("Failed to open rc file for append: {}", rc_path.display()))?;
+    file.write_all(to_append.as_bytes())
+        .with_context(|| format!("Failed to write to rc file: {}", rc_path.display()))?;
+
+    eprintln!("\x1b[32m✓\x1b[0m Hook appended to \x1b[90m{}\x1b[0m", rc_path.display());
+    let reload_hint = match shell_env.shell_kind {
+        ShellKind::Bash => format!("source {}", rc_path.display()),
+        ShellKind::Zsh  => format!("source {}", rc_path.display()),
+        ShellKind::Fish => format!("source {}", rc_path.display()),
+        ShellKind::PowerShell => format!(". \"{}\"", rc_path.display()),
+        _ => format!("reload your shell (or source {})", rc_path.display()),
+    };
+    eprintln!("  Reload with: \x1b[33m{}\x1b[0m", reload_hint);
     Ok(())
+}
+
+/// Default rc file path per shell. Returns None when the shell is unrecognised
+/// or when we cannot resolve $HOME / $PROFILE — caller falls back to prompting.
+fn default_rc_path(shell: &crate::platform::shell::ShellKind) -> Option<std::path::PathBuf> {
+    use crate::platform::shell::ShellKind;
+    let home = dirs::home_dir()?;
+    match shell {
+        ShellKind::Bash => Some(home.join(".bashrc")),
+        ShellKind::Zsh  => Some(home.join(".zshrc")),
+        ShellKind::Fish => Some(home.join(".config").join("fish").join("config.fish")),
+        ShellKind::PowerShell => powershell_profile_path().or_else(|| {
+            // Conventional fallback (Windows PowerShell 5.x)
+            Some(home.join("Documents").join("WindowsPowerShell").join("Microsoft.PowerShell_profile.ps1"))
+        }),
+        ShellKind::Cmd | ShellKind::Unknown(_) => None,
+    }
+}
+
+/// Query the actual $PROFILE path from PowerShell. Returns None if PowerShell
+/// isn't on PATH or the query fails.
+fn powershell_profile_path() -> Option<std::path::PathBuf> {
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", "$PROFILE"])
+        .output()
+        .ok()?;
+    if !output.status.success() { return None; }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() { None } else { Some(std::path::PathBuf::from(path)) }
+}
+
+/// Minimal tilde expansion for the rc-path prompt — handles only a leading "~/".
+fn shellexpand_tilde(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().to_string();
+        }
+    }
+    s.to_string()
 }
 
 async fn cmd_resolve(input: &str, paths: &ShellmindPaths) -> Result<()> {
@@ -140,7 +281,7 @@ async fn cmd_exec(verb: &str, slots: &[String], paths: &ShellmindPaths) -> Resul
     match &entry.kind {
         EntryKind::Procedure { steps, .. } => {
             let step_kinds: Vec<_> = steps.iter().map(|s| s.step.clone()).collect();
-            let mut exec = Executor::new(Platform::current());
+            let mut exec = Executor::new(Platform::current()).interactive();
             let results = exec.run_steps(&step_kinds, slots, false).await?;
             let failed = results.iter().filter(|r| !r.success).count();
             if failed > 0 {
@@ -229,12 +370,17 @@ fn cmd_wrap(rest: &[String], paths: &ShellmindPaths) -> Result<()> {
     registry.write_toml(&entry)?;
 
     // Add to embedding store
-    let embed_text = format!("{} {}", verb, slot_assignments.iter()
+    let embed_str = format!("{} {}", verb, slot_assignments.iter()
         .map(|(_, l)| l.as_str()).collect::<Vec<_>>().join(" "));
-    let vec = embed_text_bow(&embed_text, EMBED_DIM);
-    let mut store = EmbeddingStore::load_or_create(&paths.embeddings_bin, EMBED_DIM)?;
-    store.upsert(verb, crate::embedder::EmbeddingSource::Wrapped, vec);
-    store.save()?;
+    let vec = embed_text(&embed_str, EMBED_DIM);
+    let mut emb_store = EmbeddingStore::load_or_create(&paths.embeddings_bin, EMBED_DIM)?;
+    emb_store.upsert(verb, crate::embedder::EmbeddingSource::Wrapped, vec);
+    emb_store.save()?;
+
+    // Sync to redb staging store so sm resolve can find it immediately
+    if let Some(db) = open_store(&paths.staging_db) {
+        let _ = db.put(&entry);
+    }
 
     println!("  ✓ Saved '{}' to staging. Run `sm confirm {}` to promote to curated.", verb, verb);
     Ok(())
@@ -260,38 +406,122 @@ fn cmd_demote(verb: &str, paths: &ShellmindPaths) -> Result<()> {
     Ok(())
 }
 
-fn cmd_list(staging: bool, paths: &ShellmindPaths) -> Result<()> {
+fn cmd_list(rest: &[String], paths: &ShellmindPaths) -> Result<()> {
+    // Parse flags and optional pattern
+    let staging   = rest.iter().any(|a| a == "--staging");
+    let detail    = rest.iter().any(|a| a == "--detail");
+    let by_usage  = rest.iter().any(|a| a == "--by-usage");
+    let by_date   = rest.iter().any(|a| a == "--by-date");
+    let pattern   = rest.iter().find(|a| !a.starts_with("--")).map(|s| s.to_lowercase());
+
     let registry = build_registry(paths);
     let dir = if staging { &registry.staging_dir } else { &registry.curated_dir };
-    let entries = registry.load_all_from_dir(dir)?;
+    let mut entries = registry.load_all_from_dir(dir)?;
+
+    // Always load the other store for the footer count
+    let other_count = if staging {
+        registry.load_all_from_dir(&registry.curated_dir).map(|e| e.len()).unwrap_or(0)
+    } else {
+        registry.load_all_from_dir(&registry.staging_dir).map(|e| e.len()).unwrap_or(0)
+    };
+
+    // Filter by pattern
+    if let Some(ref pat) = pattern {
+        entries.retain(|e| e.verb.to_lowercase().contains(pat.as_str()));
+    }
 
     if entries.is_empty() {
-        println!("No entries in {} registry.", if staging { "staging" } else { "curated" });
+        let msg = if let Some(ref pat) = pattern {
+            format!("No entries matching '{}'.", pat)
+        } else {
+            format!("No entries in {} registry.", if staging { "staging" } else { "curated" })
+        };
+        println!("{}", msg);
+        // Still show footer
+        if !staging && other_count > 0 {
+            println!("  \x1b[90m({} in staging)\x1b[0m", other_count);
+        }
         return Ok(());
     }
 
-    let label = if staging { "STAGING" } else { "CURATED" };
-    println!("\n  {} ({} entries)\n", label, entries.len());
-    println!("  {:<24} {:<12} {:<8} {}", "VERB", "KIND", "USES", "CONFIDENCE");
-    println!("  {}", "-".repeat(60));
+    // Sort
+    if by_usage {
+        entries.sort_by(|a, b| b.usage_count.cmp(&a.usage_count));
+    } else if by_date {
+        entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    } else {
+        entries.sort_by(|a, b| a.verb.cmp(&b.verb));
+    }
 
-    for e in &entries {
-        let kind = match &e.kind {
-            EntryKind::Alias { .. } => "alias",
-            EntryKind::Procedure { .. } => if e.is_wrapped() { "proc:wr" } else { "proc" },
-        };
-        println!("  {:<24} {:<12} {:<8} {:.0}%",
-            e.verb, kind, e.usage_count, e.confidence * 100.0);
+    let label = if staging { "STAGING" } else { "CURATED" };
+    let filter_note = pattern.as_deref().map(|p| format!(" matching '{}'", p)).unwrap_or_default();
+    println!("\n  \x1b[1m{}\x1b[0m  \x1b[90m{} entries{}\x1b[0m\n", label, entries.len(), filter_note);
+
+    if detail {
+        println!("  {:<24} {:<10} {:<6} {:<6}  {}", "VERB", "KIND", "USES", "CONF", "DETAIL");
+        println!("  {}", "-".repeat(72));
+        for e in &entries {
+            let (kind, detail_str) = match &e.kind {
+                EntryKind::Alias { expansion, .. } => {
+                    let truncated = if expansion.chars().count() > 36 {
+                        let head: String = expansion.chars().take(35).collect();
+                        format!("{}…", head)
+                    } else {
+                        expansion.clone()
+                    };
+                    ("alias", truncated)
+                }
+                EntryKind::Procedure { steps, .. } => {
+                    let kind = if e.is_wrapped() { "proc:wr" } else { "proc" };
+                    (kind, format!("{} steps", steps.len()))
+                }
+            };
+            println!("  {:<24} {:<10} {:<6} {:<5}%  \x1b[90m{}\x1b[0m",
+                e.verb, kind, e.usage_count, (e.confidence * 100.0) as u32, detail_str);
+        }
+    } else {
+        println!("  {:<24} {:<10} {:<6} {}", "VERB", "KIND", "USES", "CONF");
+        println!("  {}", "-".repeat(52));
+        for e in &entries {
+            let kind = match &e.kind {
+                EntryKind::Alias { .. } => "alias",
+                EntryKind::Procedure { .. } => if e.is_wrapped() { "proc:wr" } else { "proc" },
+            };
+            println!("  {:<24} {:<10} {:<6} {:.0}%",
+                e.verb, kind, e.usage_count, e.confidence * 100.0);
+        }
+    }
+
+    // Footer: show count from the other store
+    if !staging && other_count > 0 {
+        println!("\n  \x1b[90m+{} in staging  (sm list --staging)\x1b[0m", other_count);
+    } else if staging && other_count > 0 {
+        println!("\n  \x1b[90m+{} in curated  (sm list)\x1b[0m", other_count);
     }
     println!();
     Ok(())
 }
 
 fn cmd_reindex(paths: &ShellmindPaths) -> Result<()> {
+    let registry = build_registry(paths);
+
+    // Rebuild redb stores from TOML source of truth
+    let curated_count = match RegistryStore::open(&paths.curated_db) {
+        Ok(store) => store.rebuild_from_toml_dir(&registry.curated_dir, &registry)?,
+        Err(e) => { eprintln!("  \x1b[33m!\x1b[0m curated store unavailable: {}", e); 0 }
+    };
+    let staging_count = match RegistryStore::open(&paths.staging_db) {
+        Ok(store) => store.rebuild_from_toml_dir(&registry.staging_dir, &registry)?,
+        Err(e) => { eprintln!("  \x1b[33m!\x1b[0m staging store unavailable: {}", e); 0 }
+    };
+
+    // Rebuild embeddings (uses redb now that stores exist)
     let mut resolver = build_resolver(paths)?;
     resolver.refresh()?;
-    let count = resolver.reindex()?;
-    println!("✓ Reindexed {} entries.", count);
+    let embed_count = resolver.reindex()?;
+
+    println!("✓ Reindexed {} curated + {} staging entries, {} embeddings updated.",
+        curated_count, staging_count, embed_count);
     Ok(())
 }
 
@@ -311,6 +541,227 @@ fn cmd_promote(paths: &ShellmindPaths) -> Result<()> {
     Ok(())
 }
 
+fn cmd_remove(verb: &str, paths: &ShellmindPaths) -> Result<()> {
+    use std::io::{BufRead, Write};
+
+    let registry = build_registry(paths);
+
+    // Find which store the verb lives in
+    let curated_path = registry.curated_dir.join(format!("{}.toml", verb));
+    let staging_path = registry.staging_dir.join(format!("{}.toml", verb));
+    let (toml_path, store_name) = if curated_path.exists() {
+        (curated_path, "curated")
+    } else if staging_path.exists() {
+        (staging_path, "staging")
+    } else {
+        anyhow::bail!("'{}' not found in curated or staging.", verb);
+    };
+
+    // Load and preview the entry
+    let dir = if store_name == "curated" { &registry.curated_dir } else { &registry.staging_dir };
+    let entries = registry.load_all_from_dir(dir)?;
+    let entry = entries.iter()
+        .find(|e| e.verb == verb)
+        .with_context(|| format!("Could not load entry for '{}'", verb))?;
+
+    eprintln!("  Found '{}' in {}.", verb, store_name);
+    print_entry_detail(entry);
+
+    // Confirm
+    print!("  Remove? [y/N] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    if !line.trim().eq_ignore_ascii_case("y") {
+        println!("  Cancelled.");
+        return Ok(());
+    }
+
+    // Delete TOML file
+    std::fs::remove_file(&toml_path)
+        .with_context(|| format!("Failed to delete {}", toml_path.display()))?;
+
+    // Remove from redb store
+    let db_path = if store_name == "curated" { &paths.curated_db } else { &paths.staging_db };
+    if let Some(db) = open_store(db_path) {
+        let _ = db.delete(verb);
+    }
+
+    // Remove from embedding store
+    let mut emb_store = EmbeddingStore::load_or_create(&paths.embeddings_bin, EMBED_DIM)?;
+    emb_store.remove(verb);
+    emb_store.save()?;
+
+    println!("  \x1b[32m✓\x1b[0m Removed '{}'.", verb);
+    Ok(())
+}
+
+async fn cmd_run(verb: &str, slots: &[String], paths: &ShellmindPaths) -> Result<()> {
+    let registry = build_registry(paths);
+    let mut all = registry.load_all_from_dir(&registry.curated_dir)?;
+    all.extend(registry.load_all_from_dir(&registry.staging_dir)?);
+
+    let entry = all.into_iter()
+        .find(|e| e.verb == verb)
+        .with_context(|| format!("'{}' not found in registry.", verb))?;
+
+    match &entry.kind {
+        EntryKind::Alias { expansion, arg_names } => {
+            let mut cmd = expansion.clone();
+            for (i, name) in arg_names.iter().enumerate() {
+                if let Some(val) = slots.get(i) {
+                    cmd = cmd.replace(&format!("{{{}}}", name), val);
+                }
+            }
+            eprintln!("  \x1b[90m→\x1b[0m {}", cmd);
+            let (program, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+            let status = tokio::process::Command::new(program)
+                .arg(flag).arg(&cmd)
+                .status().await?;
+            if !status.success() {
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
+        EntryKind::Procedure { steps, .. } => {
+            if steps.is_empty() {
+                anyhow::bail!("'{}' has no steps to run.", verb);
+            }
+            let total = steps.len();
+            let step_kinds: Vec<_> = steps.iter().map(|s| s.step.clone()).collect();
+            let descriptions: Vec<String> = steps.iter().map(|s| {
+                s.description.clone().unwrap_or_else(|| format!("{:?}", s.step).split_whitespace().next().unwrap_or("step").to_string())
+            }).collect();
+
+            let mut exec = Executor::new(Platform::current());
+            let mut outputs: Vec<Option<String>> = vec![];
+            let mut succeeded = 0usize;
+
+            for (i, step) in step_kinds.iter().enumerate() {
+                eprint!("  [{}/{}] {} … ", i + 1, total, descriptions[i]);
+                let result = exec.run_steps(std::slice::from_ref(step), slots, true).await?;
+                let r = &result[0];
+                if r.success {
+                    eprintln!("\x1b[32m✓\x1b[0m");
+                    succeeded += 1;
+                } else {
+                    eprintln!("\x1b[31m✗\x1b[0m");
+                }
+                outputs.push(r.output.clone());
+            }
+
+            let color = if succeeded == total { "\x1b[32m" } else { "\x1b[33m" };
+            eprintln!("  {}Done. ({}/{} steps succeeded)\x1b[0m", color, succeeded, total);
+            if succeeded < total {
+                std::process::exit(1);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_edit(verb: &str, paths: &ShellmindPaths) -> Result<()> {
+    let registry = build_registry(paths);
+
+    let curated_path = registry.curated_dir.join(format!("{}.toml", verb));
+    let staging_path = registry.staging_dir.join(format!("{}.toml", verb));
+    let toml_path = if curated_path.exists() {
+        curated_path
+    } else if staging_path.exists() {
+        staging_path
+    } else {
+        anyhow::bail!("'{}' not found in curated or staging.", verb);
+    };
+
+    crate::editor::open_in_editor(&toml_path)?;
+    crate::editor::reload_and_reindex(verb, paths)?;
+
+    eprintln!("  \x1b[32m✓\x1b[0m '{}' saved and re-indexed.", verb);
+    Ok(())
+}
+
+fn cmd_rename(old_verb: &str, new_verb: &str, paths: &ShellmindPaths) -> Result<()> {
+    use std::io::{BufRead, Write};
+
+    let registry = build_registry(paths);
+
+    // Locate the source entry
+    let curated_old = registry.curated_dir.join(format!("{}.toml", old_verb));
+    let staging_old = registry.staging_dir.join(format!("{}.toml", old_verb));
+    let (old_toml, store_dir, store_name) = if curated_old.exists() {
+        (curated_old, &registry.curated_dir, "curated")
+    } else if staging_old.exists() {
+        (staging_old, &registry.staging_dir, "staging")
+    } else {
+        anyhow::bail!("'{}' not found in curated or staging.", old_verb);
+    };
+
+    // Collision check
+    let curated_new = registry.curated_dir.join(format!("{}.toml", new_verb));
+    let staging_new = registry.staging_dir.join(format!("{}.toml", new_verb));
+    if curated_new.exists() || staging_new.exists() {
+        let existing_store = if curated_new.exists() { "curated" } else { "staging" };
+        eprintln!("  \x1b[33m!\x1b[0m '{}' already exists in {}.", new_verb, existing_store);
+        print!("  Overwrite? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        if !line.trim().eq_ignore_ascii_case("y") {
+            println!("  Cancelled.");
+            return Ok(());
+        }
+        // Remove the colliding file so write_toml won't conflict
+        let collision_path = if curated_new.exists() { &curated_new } else { &staging_new };
+        std::fs::remove_file(collision_path)?;
+    }
+
+    // Load the entry, update verb, write new TOML, delete old
+    let entries = registry.load_all_from_dir(store_dir)?;
+    let mut entry = entries.into_iter()
+        .find(|e| e.verb == old_verb)
+        .with_context(|| format!("Could not load entry for '{}'", old_verb))?;
+
+    entry.verb = new_verb.to_string();
+
+    // Write to the same store the original lived in
+    let new_toml_path = store_dir.join(format!("{}.toml", new_verb));
+    let serialized = entry.to_toml_file()?;
+    std::fs::write(&new_toml_path, serialized)
+        .with_context(|| format!("Failed to write {}", new_toml_path.display()))?;
+
+    std::fs::remove_file(&old_toml)
+        .with_context(|| format!("Failed to delete {}", old_toml.display()))?;
+
+    // Update redb store: remove old, insert new
+    let db_path = if store_name == "curated" { &paths.curated_db } else { &paths.staging_db };
+    if let Some(db) = open_store(db_path) {
+        let _ = db.delete(old_verb);
+        let _ = db.put(&entry);
+    }
+
+    // Update embedding store: remove old key, upsert new key with fresh vector
+    let embed_str = match &entry.kind {
+        EntryKind::Alias { expansion, arg_names } =>
+            format!("{} {} {}", new_verb, arg_names.join(" "), expansion),
+        EntryKind::Procedure { description, .. } =>
+            format!("{} {}", new_verb, description.as_deref().unwrap_or("")),
+    };
+    let source = if entry.is_wrapped() {
+        crate::embedder::EmbeddingSource::Wrapped
+    } else if store_name == "staging" {
+        crate::embedder::EmbeddingSource::Staging
+    } else {
+        crate::embedder::EmbeddingSource::Curated
+    };
+    let vec = embed_text(&embed_str, EMBED_DIM);
+    let mut store = EmbeddingStore::load_or_create(&paths.embeddings_bin, EMBED_DIM)?;
+    store.remove(old_verb);
+    store.upsert(new_verb, source, vec);
+    store.save()?;
+
+    println!("  \x1b[32m✓\x1b[0m Renamed '{}' → '{}'.", old_verb, new_verb);
+    Ok(())
+}
+
 // ── Builders ─────────────────────────────────────────────────────────────────
 
 fn build_registry(paths: &ShellmindPaths) -> Registry {
@@ -325,7 +776,12 @@ fn build_resolver(paths: &ShellmindPaths) -> Result<Resolver> {
     let embeddings = EmbeddingStore::load_or_create(&paths.embeddings_bin, EMBED_DIM)?;
     let model_config = load_model_config(paths);
     let model = ModelClient::new(model_config);
-    Ok(Resolver::new(registry, embeddings, model))
+    Ok(Resolver::new(registry, embeddings, model)
+        .with_store(paths.curated_db.clone(), paths.staging_db.clone()))
+}
+
+fn open_store(path: &std::path::Path) -> Option<RegistryStore> {
+    RegistryStore::open(path).ok()
 }
 
 fn load_model_config(paths: &ShellmindPaths) -> ModelConfig {
@@ -362,7 +818,8 @@ USAGE
   sm <command> [args]
 
 COMMANDS
-  init                     First-time setup, prints shell hook
+  init [--write]           First-time setup. Prints shell hook (default)
+                           or appends it to your rc file (with --write).
   hook                     Print shell hook snippet for your rc file
 
   resolve <input>          Resolve a command (called by shell hook)
@@ -378,7 +835,15 @@ COMMANDS
 
   confirm <verb>           Promote a staging entry to curated
   demote  <verb>           Move a curated entry back to staging
-  list [--staging]         List curated (default) or staging entries
+  remove  <verb>           Delete a verb from the registry and embeddings
+  rename  <old> <new>      Rename a verb, preserving its definition and embedding
+  edit    <verb>           Open a verb's definition in $EDITOR, re-index on save
+
+  run     <verb> [args]   Execute a verb directly (no shell hook needed)
+                           Prints step-by-step progress for procedures
+  list [--staging] [--detail] [--by-usage|--by-date] [pattern]
+                           List registry entries. Filter by pattern substring,
+                           sort by usage or date (default: alphabetical).
   reindex                  Rebuild embedding store from registry
   promote                  Run automatic promotion/decay pass
 
@@ -450,10 +915,16 @@ fn cmd_add(rest: &[String], paths: &ShellmindPaths) -> Result<()> {
             print_entry_detail(e);
         }
 
-        // If no expansion given, just show and exit
+        // If no expansion given, offer edit or cancel
         if rest.len() < 2 {
-            println!("\n  Run `sm add {} \"<new expansion>\" [args...]` to replace.", verb);
-            println!("  Run `sm edit {}` to open in editor.", verb);
+            print!("\n  [e]dit in $EDITOR, or any other key to cancel: ");
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            std::io::stdin().lock().read_line(&mut line)?;
+            if line.trim().eq_ignore_ascii_case("e") {
+                return cmd_edit(&verb, paths);
+            }
+            println!("  Cancelled.");
             return Ok(());
         }
 
@@ -798,22 +1269,28 @@ fn write_and_index(entry: &CommandEntry, paths: &ShellmindPaths) -> Result<()> {
     let registry = build_registry(paths);
     registry.write_toml(entry)?;
 
+    // Sync to redb store
+    let db_path = if entry.is_curated() { &paths.curated_db } else { &paths.staging_db };
+    if let Some(store) = open_store(db_path) {
+        let _ = store.put(entry);
+    }
+
     // Build embedding immediately
     let text = match &entry.kind {
         EntryKind::Alias { expansion, arg_names } =>
             format!("{} {} {}", entry.verb, arg_names.join(" "), expansion),
-        EntryKind::Procedure { steps, description, .. } =>
+        EntryKind::Procedure { steps: _, description, .. } =>
             format!("{} {}", entry.verb, description.as_deref().unwrap_or("")),
     };
-    let vec = embed_text_bow(&text, EMBED_DIM);
+    let vec = embed_text(&text, EMBED_DIM);
     let source = if entry.is_wrapped() {
         crate::embedder::EmbeddingSource::Wrapped
     } else {
         crate::embedder::EmbeddingSource::Curated
     };
-    let mut store = EmbeddingStore::load_or_create(&paths.embeddings_bin, EMBED_DIM)?;
-    store.upsert(&entry.verb, source, vec);
-    store.save()?;
+    let mut emb_store = EmbeddingStore::load_or_create(&paths.embeddings_bin, EMBED_DIM)?;
+    emb_store.upsert(&entry.verb, source, vec);
+    emb_store.save()?;
     Ok(())
 }
 

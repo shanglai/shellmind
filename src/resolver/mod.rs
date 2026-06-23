@@ -8,15 +8,19 @@
 
 use anyhow::Result;
 
+use std::path::PathBuf;
+
 use crate::disambiguator::{
     self, DisambiguationResult, ScoredCandidate, AUTOSELECT_CEILING, AUTOSELECT_GAP,
 };
-use crate::embedder::{EmbeddingSource, EmbeddingStore, embed_text_bow};
+use crate::embedder::{EmbeddingSource, EmbeddingStore, embed_text};
 use crate::model_client::ModelClient;
 use crate::registry::{CommandEntry, EntryKind, EntrySource, Registry};
+use crate::registry::store::RegistryStore;
 use crate::session::SessionEntry;
 
-pub const EMBED_DIM: usize = 512;
+#[allow(unused_imports)]
+pub use crate::embedder::EMBED_DIM;
 pub const SIMILARITY_THRESHOLD: f32 = 0.72; // slightly lower — disambiguator handles false positives
 pub const TOP_K: usize = 5;
 
@@ -68,16 +72,45 @@ pub struct Resolver {
     pub embeddings: EmbeddingStore,
     pub model: ModelClient,
     entries: Vec<CommandEntry>,
+    curated_db: Option<PathBuf>,
+    staging_db: Option<PathBuf>,
 }
 
 impl Resolver {
     pub fn new(registry: Registry, embeddings: EmbeddingStore, model: ModelClient) -> Self {
-        Self { registry, embeddings, model, entries: vec![] }
+        Self { registry, embeddings, model, entries: vec![], curated_db: None, staging_db: None }
+    }
+
+    pub fn with_store(mut self, curated_db: PathBuf, staging_db: PathBuf) -> Self {
+        self.curated_db = Some(curated_db);
+        self.staging_db = Some(staging_db);
+        self
     }
 
     pub fn refresh(&mut self) -> Result<()> {
+        // Fast path: load from redb if both store files exist
+        if let (Some(cd), Some(sd)) = (&self.curated_db, &self.staging_db) {
+            if cd.exists() && sd.exists() {
+                match (RegistryStore::open(cd), RegistryStore::open(sd)) {
+                    (Ok(cs), Ok(ss)) => {
+                        match (cs.all_entries(), ss.all_entries()) {
+                            (Ok(mut curated), Ok(staging)) => {
+                                curated.extend(staging);
+                                self.entries = curated;
+                                tracing::debug!("[refresh] loaded {} entries from redb", self.entries.len());
+                                return Ok(());
+                            }
+                            _ => tracing::warn!("[refresh] redb read failed, falling back to file scan"),
+                        }
+                    }
+                    _ => tracing::debug!("[refresh] redb unavailable, using file scan"),
+                }
+            }
+        }
+        // Fallback: scan TOML files
         let mut all = self.registry.load_all_from_dir(&self.registry.curated_dir)?;
         all.extend(self.registry.load_all_from_dir(&self.registry.staging_dir)?);
+        tracing::debug!("[refresh] loaded {} entries from TOML scan", all.len());
         self.entries = all;
         Ok(())
     }
@@ -132,7 +165,7 @@ impl Resolver {
 
         // ── Stage 3: Embedding similarity ────────────────────────────────────
         if self.embeddings.len() > 0 {
-            let query_vec = embed_text_bow(raw_input, EMBED_DIM);
+            let query_vec = embed_text(raw_input, EMBED_DIM);
             let hits = self.embeddings.search(&query_vec, TOP_K, SIMILARITY_THRESHOLD);
 
             // Build ScoredCandidate list from hits
@@ -198,7 +231,7 @@ impl Resolver {
                             &staged_verb, &expanded, confidence,
                             &self.model.config.model_name,
                         );
-                        let vec = embed_text_bow(raw_input, EMBED_DIM);
+                        let vec = embed_text(raw_input, EMBED_DIM);
                         self.embeddings.upsert(&staged_verb, EmbeddingSource::Staging, vec);
                         let _ = self.registry.write_toml(&stage_entry);
                         let _ = self.embeddings.save();
@@ -232,7 +265,7 @@ impl Resolver {
         for entry in &self.entries {
             if self.embeddings.len() == 0 || !self.embeddings.has_verb(&entry.verb) {
                 let text = entry_to_embed_text(entry);
-                let vec = embed_text_bow(&text, EMBED_DIM);
+                let vec = embed_text(&text, EMBED_DIM);
                 let source = if entry.is_curated() {
                     if entry.is_wrapped() { EmbeddingSource::Wrapped } else { EmbeddingSource::Curated }
                 } else {

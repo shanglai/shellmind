@@ -118,7 +118,7 @@ pub fn build_wrap_preview(entries: &[&SessionEntry]) -> WrapPreview {
         WrapPreviewStep {
             index: i,
             description: summarize_command(&e.resolved_command),
-            raw: e.raw_input.clone(),
+            raw: e.resolved_command.clone(),
         }
     }).collect();
 
@@ -137,7 +137,9 @@ pub fn finalize_wrap(
     let session_indices: Vec<usize> = entries.iter().map(|e| e.index).collect();
 
     let proc_steps: Vec<ProcStep> = entries.iter().enumerate().map(|(i, e)| {
-        let mut template = e.raw_input.clone();
+        // Use resolved_command so the step runs the actual shell command,
+        // not the sm verb (which sh -c can't execute)
+        let mut template = e.resolved_command.clone();
         for (token, label) in slot_assignments {
             template = template.replace(token.as_str(), &format!("{{{}}}", label));
         }
@@ -196,7 +198,7 @@ fn detect_slot_candidates(entries: &[&SessionEntry]) -> Vec<SlotCandidate> {
 
     // Tokens that look like paths or URLs and appear in at least one step
     for entry in entries {
-        for token in entry.raw_input.split_whitespace() {
+        for token in entry.resolved_command.split_whitespace() {
             let looks_like_slot = token.contains('/')
                 || token.contains('\\')
                 || token.contains('.')
@@ -207,7 +209,7 @@ fn detect_slot_candidates(entries: &[&SessionEntry]) -> Vec<SlotCandidate> {
                     token: token.to_string(),
                     slot_label: format!("${}", slot_counter),
                     appears_in_steps: entries.iter().enumerate()
-                        .filter(|(_, e)| e.raw_input.contains(token))
+                        .filter(|(_, e)| e.resolved_command.contains(token))
                         .map(|(i, _)| i)
                         .collect(),
                 });
