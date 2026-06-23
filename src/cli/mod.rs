@@ -331,8 +331,8 @@ fn cmd_wrap(rest: &[String], paths: &ShellmindPaths) -> Result<()> {
     // Show preview
     println!("\n  Wrapping {} steps as '{}':\n", candidates.len(), verb);
     for step in &preview.steps {
-        println!("  [{}] {}", step.index + 1, step.description);
-        println!("       > {}", step.raw);
+        println!("  [{}] {} \x1b[90m[{}]\x1b[0m", step.index + 1, step.description, step.inferred_kind);
+        println!("       \x1b[90m>\x1b[0m {}", step.raw);
     }
 
     if !preview.slot_candidates.is_empty() {

@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::platform::StepKind;
 use crate::registry::{ArgBind, CommandEntry, EntryKind, EntrySource, ProcStep};
 
+mod infer;
+
 pub const MAX_HISTORY: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +105,10 @@ pub struct WrapPreviewStep {
     pub index: usize,
     pub description: String,
     pub raw: String,
+    /// Friendly tag for the StepKind the wrap will produce — "http", "copy",
+    /// "shell", etc. Surfaced in the wrap preview so the user can see what
+    /// they're getting before confirming.
+    pub inferred_kind: &'static str,
 }
 
 #[derive(Debug)]
@@ -119,6 +125,7 @@ pub fn build_wrap_preview(entries: &[&SessionEntry]) -> WrapPreview {
             index: i,
             description: summarize_command(&e.resolved_command),
             raw: e.resolved_command.clone(),
+            inferred_kind: infer::infer_kind_label(&e.resolved_command),
         }
     }).collect();
 
@@ -137,18 +144,14 @@ pub fn finalize_wrap(
     let session_indices: Vec<usize> = entries.iter().map(|e| e.index).collect();
 
     let proc_steps: Vec<ProcStep> = entries.iter().enumerate().map(|(i, e)| {
-        // Use resolved_command so the step runs the actual shell command,
-        // not the sm verb (which sh -c can't execute)
-        let mut template = e.resolved_command.clone();
-        for (token, label) in slot_assignments {
-            template = template.replace(token.as_str(), &format!("{{{}}}", label));
-        }
+        // Infer the most specific StepKind we can. Typed kinds (HttpCall,
+        // FileCopy, etc.) use `Arg::Slot(i)` so they thread slot values
+        // through the executor cleanly. The fallback is `ShellRaw` with
+        // POSIX-style `$N` placeholders, resolved by Executor::shell_raw.
+        let step = infer::infer_step(&e.resolved_command, slot_assignments);
         ProcStep {
             index: i,
-            step: StepKind::ShellRaw {
-                cmd: template,
-                platform: crate::platform::Platform::current(),
-            },
+            step,
             description: Some(summarize_command(&e.resolved_command)),
             depends_on: if i > 0 { vec![i - 1] } else { vec![] },
         }

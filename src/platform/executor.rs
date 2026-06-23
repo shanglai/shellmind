@@ -152,7 +152,8 @@ impl Executor {
                 if *platform != Platform::current() {
                     anyhow::bail!("ShellRaw tagged for {:?}, running on {:?}", platform, Platform::current());
                 }
-                self.shell_raw(cmd).await
+                let resolved = substitute_positional_slots(cmd, slots);
+                self.shell_raw(&resolved).await
             }
             StepKind::Echo { message } => {
                 let msg = message.resolve(slots, outputs)?;
@@ -203,6 +204,19 @@ impl Executor {
 
 fn ok(output: Option<String>) -> StepResult {
     StepResult { success: true, output, exit_code: Some(0) }
+}
+
+/// Replace `$1`, `$2`, … in a shell-raw command with the positional slot
+/// values. Iterates in reverse index order so `$10` is substituted before
+/// `$1`, preventing partial matches when more than 9 slots are bound.
+fn substitute_positional_slots(cmd: &str, slots: &[String]) -> String {
+    let mut indexed: Vec<(usize, &String)> = slots.iter().enumerate().collect();
+    indexed.sort_by_key(|(i, _)| std::cmp::Reverse(*i));
+    let mut out = cmd.to_string();
+    for (i, val) in indexed {
+        out = out.replace(&format!("${}", i + 1), val);
+    }
+    out
 }
 
 fn copy_dir_recursive(src: &str, dst: &str) -> Result<()> {
