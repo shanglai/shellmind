@@ -46,6 +46,11 @@ impl ShellmindPaths {
         })
     }
 
+    /// Agennect cache directory — agent cards + last Lister listing.
+    pub fn agennect_dir(&self) -> PathBuf {
+        self.config_dir.join("agennect")
+    }
+
     /// Create all directories that need to exist at startup.
     pub fn ensure_dirs(&self) -> Result<()> {
         for dir in [

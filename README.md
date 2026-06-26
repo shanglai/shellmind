@@ -29,6 +29,7 @@ When multiple candidates are close, a disambiguation prompt is shown on stderr. 
 - **Confidence decay** — staging entries not used in 30 days are flagged for review
 - **Shell-agnostic hook** — works with Bash, Zsh, Fish, PowerShell, and Cmd; `sm init [--write]` prints the correct snippet for your shell or appends it to your rc file directly. Bash/Zsh/Fish/PowerShell all capture native commands via `PROMPT_COMMAND`/`precmd`/`fish_postexec`/prompt-wrapping so `sm wrap` can see them
 - **Scheduled procedures** — `sm schedule add <name> "<cron>" <verb> [args...]` registers a 5-field cron; `sm schedule run` executes all due jobs (wire it into Unix cron or Windows Task Scheduler)
+- **Agennect dispatcher** — `sm a.n lister <goal>` searches the [Agennect](https://agennect.com) agent marketplace via its Lister agent; follow-ups by index (`sm a.n 0 …`) or name (`sm a.n pipelinebot …`) call any agent directly. Procedural HTTP, no LLM in the dispatch path
 - **Model-free by default** — all four resolution stages degrade gracefully; model inference is opt-in via environment variable
 - **Cross-platform executor** — 12 `StepKind` variants implemented in pure Rust with no `awk`/`python`/shell dependencies
 
@@ -61,6 +62,10 @@ When multiple candidates are close, a disambiguation prompt is shown on stderr. 
 | `sm schedule next` | Show upcoming runs sorted ascending |
 | `sm schedule run` | Run all due schedules now (wire into cron/Task Scheduler) |
 | `sm schedule remove <name>` / `enable <name>` / `disable <name>` | Lifecycle management |
+| `sm a.n lister <goal text>` | Search the Agennect marketplace via the Lister agent |
+| `sm a.n <index> <args>` | Run an agent by index from the last Lister listing |
+| `sm a.n <agent-name> <args>` | Run a named Agennect agent directly |
+| `sm a.n list` / `sm a.n refresh` | Inspect the cached listing / refresh the Lister card |
 
 ---
 

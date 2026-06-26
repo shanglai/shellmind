@@ -8,6 +8,7 @@ mod model_client;
 mod executor;
 mod editor;
 mod scheduler;
+mod agennect;
 mod cli;
 
 use anyhow::Result;

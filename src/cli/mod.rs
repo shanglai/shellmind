@@ -86,6 +86,7 @@ pub async fn dispatch(args: Vec<String>, paths: ShellmindPaths, shell_env: Shell
             cmd_run(verb, &slots, &paths).await
         }
         "schedule" => cmd_schedule(&args[2..], &paths).await,
+        "a.n" | "agennect" => crate::agennect::dispatch(&args[2..], &paths).await,
         "__record" => {
             // Called by the shell PROMPT_COMMAND hook to capture native commands
             let cmd = args[2..].join(" ");
@@ -1068,6 +1069,12 @@ COMMANDS
                            Toggle a schedule without removing it
   schedule next            Show upcoming runs sorted by time
   schedule run             Run all due schedules now (wire into cron/Task Scheduler)
+
+  a.n lister <goal>        Search Agennect marketplace via the Lister agent
+  a.n <index> <args>       Run an agent by index from the last Lister listing
+  a.n <agent-name> <args>  Run a named agent on Agennect
+  a.n list                 Show the last cached Lister listing
+  a.n refresh              Re-fetch the Lister card
 
 REGISTRY FILES
   Curated  ~/.config/shellmind/registry/curated/   (TOML, hand-editable)

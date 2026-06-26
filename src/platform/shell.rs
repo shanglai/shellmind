@@ -53,7 +53,7 @@ impl ShellEnv {
 # shellmind hook — add to ~/.bashrc
 function sm() {
     case "$1" in
-        init|hook|add|wrap|confirm|demote|list|reindex|promote|remove|rename|edit|run|schedule|resolve|__exec|__record|help|--help|-h)
+        init|hook|add|wrap|confirm|demote|list|reindex|promote|remove|rename|edit|run|schedule|a.n|agennect|resolve|__exec|__record|help|--help|-h)
             command sm "$@"
             ;;
         *)
@@ -85,7 +85,7 @@ fi
 # shellmind hook — add to ~/.zshrc
 function sm() {
     case "$1" in
-        init|hook|add|wrap|confirm|demote|list|reindex|promote|remove|rename|edit|run|schedule|resolve|__exec|__record|help|--help|-h)
+        init|hook|add|wrap|confirm|demote|list|reindex|promote|remove|rename|edit|run|schedule|a.n|agennect|resolve|__exec|__record|help|--help|-h)
             command sm "$@"
             ;;
         *)
@@ -116,7 +116,7 @@ fi
 # shellmind hook — add to ~/.config/fish/config.fish
 function sm
     switch $argv[1]
-    case init hook add wrap confirm demote list reindex promote remove rename edit run schedule resolve __exec __record help
+    case init hook add wrap confirm demote list reindex promote remove rename edit run schedule a.n agennect resolve __exec __record help
         command sm $argv
     case '*'
         set result (command sm resolve $argv 2>/tmp/sm_err)
@@ -138,7 +138,7 @@ end
             ShellKind::PowerShell => r#"
 # shellmind hook — add to $PROFILE
 function sm {
-    $mgmt = @('init','hook','add','wrap','confirm','demote','list','reindex','promote','remove','rename','edit','run','schedule','resolve','__exec','__record','help','--help','-h')
+    $mgmt = @('init','hook','add','wrap','confirm','demote','list','reindex','promote','remove','rename','edit','run','schedule','a.n','agennect','resolve','__exec','__record','help','--help','-h')
     if ($args.Count -eq 0 -or $mgmt -contains $args[0]) {
         & (Get-Command sm -CommandType Application).Source @args
     } else {
