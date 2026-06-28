@@ -4,6 +4,8 @@ A cross-platform personal automation kernel with semantic memory. `sm` sits in f
 
 It is **not** a smarter shell. It is a layer that resolves what you mean into what your shell should run.
 
+**Update**: You can now run agents and MCP requests -as-commands! You will now connect natively to agennect.com and its lists of Agents and Tools! Enjoy!
+
 ---
 
 ## How it works
